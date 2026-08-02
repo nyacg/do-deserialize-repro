@@ -22,7 +22,7 @@ export default { fetch() { return new Response("app ok"); } };
  * ship alongside encoding changes, so a richer value is likelier to trip
  * an older reader than a bare string.
  */
-const richValue = () => ({
+export const richValue = () => ({
   note: "do-deserialize-repro",
   writtenAt: new Date(),
   big: 123456789012345678901234567890n,
@@ -31,7 +31,7 @@ const richValue = () => ({
   nested: { arr: [1, "two", null, true] },
 });
 
-const describe = (value) =>
+export const describe = (value) =>
   JSON.stringify(value, (_k, v) => {
     if (typeof v === "bigint") return `${v}n`;
     if (v instanceof Map) return Object.fromEntries(v);

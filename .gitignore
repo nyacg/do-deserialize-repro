@@ -3,3 +3,4 @@ node_modules/
 workerd/do-state/
 .wrangler/
 workerd/workerd.log
+rpc-*.log

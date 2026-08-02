@@ -36,6 +36,7 @@ stop_workerd() {
   wait "$WORKERD_PID" 2>/dev/null || true
 }
 
+pkill -f "workerd serve config.capnp" 2>/dev/null || true
 rm -rf workerd/do-state workerd/workerd.log
 mkdir -p workerd/do-state
 

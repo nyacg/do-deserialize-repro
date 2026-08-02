@@ -22,7 +22,27 @@ TARGET_PORT = int(os.environ.get("FORGE_TARGET_PORT", "8790"))
 FORGE_VERSION = int(os.environ.get("FORGE_VERSION", "255"))
 NEEDLE = b"\xff\x0f\x41"
 
+# How to damage the payload; scripts/rpc-failure-modes.sh sweeps all of them
+# to show which damage produces which error.
+MODE = os.environ.get("MODE", "version")
+
 state = {"forged": False, "sniffed": False}
+
+
+def damage(data, offset):
+    """Apply MODE to the payload starting at `offset` (the 0xFF header byte)."""
+    if MODE == "version":
+        return data[: offset + 1] + bytes([FORGE_VERSION]) + data[offset + 2 :]
+    if MODE == "firstbyte":
+        return data[:offset] + b"\x00" + data[offset + 1 :]
+    if MODE == "corrupt-mid":
+        j = offset + 30
+        return data[:j] + bytes([data[j] ^ 0xFF]) + data[j + 1 :]
+    if MODE == "truncate-tail":
+        return data[: len(data) - 40]
+    if MODE == "truncate-hard":
+        return data[: offset + 8]
+    raise SystemExit(f"unknown MODE {MODE}")
 
 
 def pump(src, dst, rewrite):
@@ -36,11 +56,12 @@ def pump(src, dst, rewrite):
         if rewrite and not state["forged"]:
             i = data.find(NEEDLE)
             if i >= 0:
-                data = data[: i + 1] + bytes([FORGE_VERSION]) + data[i + 2 :]
+                original = len(data)
+                data = damage(data, i)
                 state["forged"] = True
                 print(
-                    f"forged V8 format version 15 -> {FORGE_VERSION} "
-                    f"(offset {i} of a {len(data)}-byte frame)",
+                    f"mode={MODE} applied at offset {i} "
+                    f"({original}-byte frame -> {len(data)} bytes)",
                     flush=True,
                 )
             elif not state["sniffed"]:

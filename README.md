@@ -85,6 +85,26 @@ deserializer:
 
 `FORGE_VERSION=<n> scripts/rpc-forge.sh [build]` bisects a build's ceiling.
 
+## The error string is not specific to version skew
+
+`scripts/rpc-failure-modes.sh` damages the payload five different ways on
+the same hop and shows what each one looks like:
+
+| damage | result |
+|---|---|
+| version byte bumped past the ceiling | `Unable to deserialize cloned data due to invalid or unsupported version.` |
+| header tag `0xFF` zeroed | **same message** |
+| one byte flipped mid-payload | no error — silently corrupted data (`do-deserialize-rero`) |
+| payload truncated at the tail | `Network connection lost.` |
+| payload cut just after the header | request hangs until the caller times out |
+| payload over 32MiB | `Serialized RPC arguments or return values are limited to 32MiB…` |
+
+So the production message means only "the bytes where a V8 payload should
+start do not parse as a V8 header". A newer-build writer is one way to get
+there; a buffer read at the wrong offset, or bytes that were never a
+serialized value, produce it identically. Note also that mid-payload
+corruption is **not** caught — it returns wrong data with no error.
+
 ## Findings from running this (2026-08-02)
 
 - All four hops work under `wrangler dev` — the whole apps-runtime shape
@@ -110,6 +130,10 @@ deserializer:
   **1.20260619.1**, and sauna's onset was ~2026-06-30 — the fleet rolling
   out a post-06-19 build. Any peer still on a pre-06-19 build rejects a
   version-16 payload with exactly this error.
+- **Frequency in production contradicts a rollout-only cause.** Apps wedge
+  several times a day, in active use, on days with one or two runtime
+  rollouts. Staged skew cannot fire that often — see the failure-mode
+  table above for what else yields the identical message.
 - Both directions still round-trip between real npm builds
   (`rpc-skew.sh 1.20250502.0 1.20260801.1`), because npm readers accept 16
   but every npm **writer** still emits 15. The producing side of the

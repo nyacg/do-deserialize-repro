@@ -29,6 +29,11 @@ export default class extends WorkerEntrypoint {
     const routes = {
       "/echo": async () => await this.env.PEER.echo(richValue()),
       "/emit": async () => await this.env.PEER.emit(),
+      "/big": async () => {
+        const bytes = Number(new URL(request.url).searchParams.get("bytes") ?? 1024);
+        const reply = await this.env.PEER.echo("x".repeat(bytes));
+        return { sent: bytes, echoedLength: reply.echoed.length };
+      },
     };
     const route = routes[new URL(request.url).pathname];
     if (!route) {

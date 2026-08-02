@@ -39,6 +39,16 @@ const describe = (value) =>
     return v;
   });
 
+/**
+ * richValue() carries a bigint (plus Map/TypedArray), which Response.json()
+ * refuses to encode — describe() is the only safe way to render a hop's
+ * return value as a response body.
+ */
+const describedResponse = (value) =>
+  new Response(describe(value), {
+    headers: { "content-type": "application/json" },
+  });
+
 export class Supervisor extends DurableObject {
   /**
    * hop rpc_worker_to_do — args/return are V8-serialized across the
@@ -142,9 +152,9 @@ export default {
         case "/kv/get":
           return Response.json(await stub.kvGet("skew"));
         case "/rpc":
-          return Response.json(await stub.echo(richValue()));
+          return describedResponse(await stub.echo(richValue()));
         case "/facet":
-          return Response.json(await stub.facetRoundtrip());
+          return describedResponse(await stub.facetRoundtrip());
         default:
           return new Response(
             "routes: /probe /kv/put /kv/get /rpc /facet\n",

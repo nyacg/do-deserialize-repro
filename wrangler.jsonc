@@ -1,0 +1,16 @@
+{
+  // Production probe deployment: exercises every serialization hop the
+  // sauna apps runtime has, labeled, on request (/probe) and on a cron
+  // tick (Workers Logs pick up failures during a staged rollout).
+  "name": "do-deserialize-repro",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-04-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [{ "name": "SUPERVISOR", "class_name": "Supervisor" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Supervisor"] }],
+  "worker_loaders": [{ "binding": "LOADER" }],
+  "observability": { "enabled": true },
+  "triggers": { "crons": ["*/5 * * * *"] }
+}

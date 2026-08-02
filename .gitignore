@@ -1,0 +1,5 @@
+node_modules/
+.workerd-cache/
+workerd/do-state/
+.wrangler/
+workerd/workerd.log

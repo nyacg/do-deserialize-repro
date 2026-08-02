@@ -7,9 +7,14 @@ Unable to deserialize cloned data due to invalid or unsupported version.
 ```
 
 One plain-JS worker (`src/worker.js`, ~170 lines) mirrors every
-serialization hop of the sauna apps runtime, individually labeled, plus two
+serialization hop of the sauna apps runtime, individually labeled, plus
 scripts that reproduce the error deterministically against workerd's own
-deserializer.
+deserializer — on DO storage (`scripts/forge-version.sh`) and on the hop
+that actually wedged production (`scripts/rpc-forge.sh`).
+
+Live probe: https://do-deserialize-repro.sauna-dev.workers.dev/probe —
+deployed in the sauna Cloudflare account, cron-probing every hop every 5
+minutes. Delete with `npx wrangler delete --name do-deserialize-repro`.
 
 ## The mechanism
 

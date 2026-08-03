@@ -160,6 +160,28 @@ corruption is **not** caught — it returns wrong data with no error.
 - Episodes are bursts of 2–6 retries seconds apart, then the app recovers
   on its own.
 
+## Cold-start probe (the current bet)
+
+`src/coldstart.js` + `wrangler.coldstart.jsonc`, deployed separately as
+`do-coldstart-probe`. The `/probe` worker above hits one DO every five
+minutes, so it is never cold — it cannot catch a wedge that fires on the
+first RPC into an idle DO.
+
+This one runs 82 supervisor-shaped DOs (own SQLite + a Worker Loader facet
+with persisted state) in dwell cohorts of 15m / 1h / 6h / 24h. A one-minute
+cron probes only the DOs whose dwell has elapsed, one RPC each, and writes
+every outcome to a registry DO's SQLite so a hit survives log retention.
+
+```
+npx wrangler deploy -c wrangler.coldstart.jsonc
+curl https://do-coldstart-probe.sauna-dev.workers.dev/stats
+```
+
+Each result carries `coldBoot`, measured idle minutes, the hop that failed
+(`route_to_do` vs `do_to_facet` — the same split `withFacetRecovery` makes)
+and whether the error was the deserialize one, so edge blips and the real
+wedge stay distinguishable. Throughput is ~2 cold starts/minute (~3k/day).
+
 ## Hypotheses eliminated
 
 Each was tested on the real cross-process JSRPC hop and did **not**

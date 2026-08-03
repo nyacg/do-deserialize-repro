@@ -140,6 +140,38 @@ corruption is **not** caught — it returns wrong data with no error.
   production skew is therefore a fleet build emitting 16 — ahead of npm,
   so only Cloudflare can name it. See "Upstream" below.
 
+## What production actually shows (Honeycomb, 2026-08-03)
+
+`apps-production`, warn logs with `hop` set, last 7 days:
+
+- **161 events / 34 episodes / 15 distinct apps** — roughly five wedge
+  episodes a day, every day. All of them `label=db_query`, body
+  `db/query hit deserialize-version error`.
+- **Every one is `hop=route_to_do`. Zero `hop=do_to_facet`.** The facet
+  call and `ctx.facets.get()` both sit inside `withFacetRecovery`, so a
+  throw there would log `do_to_facet` — the failure is on the worker↔DO
+  JSRPC boundary, not the facet hop.
+- Spread across **17 apps-worker script versions** in 7 days, i.e. every
+  deployed version. Two rollouts a day cannot explain five episodes a day
+  across every version — this is continuous background behaviour, not
+  rollout skew.
+- Every episode sits inside an agent session trace: these are agent-driven
+  `db/query` tool calls, which is why it correlates with apps being used.
+- Episodes are bursts of 2–6 retries seconds apart, then the app recovers
+  on its own.
+
+## Hypotheses eliminated
+
+Each was tested on the real cross-process JSRPC hop and did **not**
+reproduce the error:
+
+| hypothesis | result |
+|---|---|
+| build skew between published builds | round-trips across `1.20250502.0` ↔ `1.20260801.1`, both directions |
+| oversized payload | 32MiB limit has its own explicit message |
+| lone surrogates / NUL / invalid pairs in row strings | all round-trip |
+| 50-way concurrent RPC on one connection | 200/200 calls clean |
+
 ## Reproduce in production (the real trigger)
 
 `npm run deploy`, then watch. The worker probes all four hops every 5

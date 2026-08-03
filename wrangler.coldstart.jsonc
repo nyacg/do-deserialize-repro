@@ -1,0 +1,23 @@
+{
+  // Cold-start wedge probe — deployed alongside the /probe worker, which
+  // stays as the rollout-era control. Deploy with:
+  //   npx wrangler deploy -c wrangler.coldstart.jsonc
+  "name": "do-coldstart-probe",
+  "main": "src/coldstart.js",
+  "compatibility_date": "2026-04-17",
+  "compatibility_flags": ["nodejs_compat"],
+  "durable_objects": {
+    "bindings": [
+      { "name": "PROBE", "class_name": "ColdProbe" },
+      { "name": "REGISTRY", "class_name": "Registry" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ColdProbe", "Registry"] }
+  ],
+  "worker_loaders": [{ "binding": "LOADER" }],
+  "observability": { "enabled": true },
+  // Every minute: the dwell schedule lives in the registry, so the tick only
+  // needs fine enough granularity to hit each probe near its due time.
+  "triggers": { "crons": ["* * * * *"] }
+}

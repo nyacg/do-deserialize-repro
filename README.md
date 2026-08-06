@@ -311,11 +311,17 @@ and no local pair of published builds fails this hop.
 
 ## The hammer fleet (self-driving, catches rollouts in the act)
 
-24 sauna-shaped instances drive themselves via DO alarms — 12 at 20s
-cadence, 12 at 60s — each alarm running a compact production-shaped
-round (schedule tick, bulk writes, blob write/read, row reads, SSE
-stream, outbound fetch, db/query, periodic redeploy) with hibernation
-wakes in between. Zero-cost to watch:
+24 sauna-shaped instances drive themselves via DO alarms at a 5-minute
+cadence — each alarm runs a compact production-shaped round (schedule
+tick, bulk writes, blob write/read, row reads, SSE stream, outbound
+fetch, db/query, periodic redeploy), and the gap between alarms means
+every tick is a genuine restart-from-idle. ~7k rounds/day across the
+fleet, roughly $1–2/day (instances evict between ticks; row writes are
+the other cost). A rollout wave sweeps a colo over tens of minutes to
+hours, so the 5-minute cadence loses no detection power; on a hit,
+restart the hammer with a small `intervalMs` for fine-grained
+persistence forensics. The separate `do-coldstart-probe` worker (82 DOs,
+1-minute cron) answered its question and has been deleted. Watch:
 
 ```
 curl $BASE/sauna/fleet?n=24        # per-instance runs / resets / hits

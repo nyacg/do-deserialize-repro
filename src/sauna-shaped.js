@@ -17,11 +17,18 @@ import { DurableObject, WorkerEntrypoint } from "cloudflare:workers";
  * plus globalOutbound (AppPipedreamProxy), blockConcurrencyWhile boot with
  * DDL + a drizzle-shaped migration journal, a facet SQLite write on every
  * dispatch (recordInput — invocationId changes per call), supervisor
- * SQLite writes bracketing every facet call, and __sqlExec returning real
- * row sets. Strip pieces out once it reproduces.
+ * SQLite writes bracketing every facet call, __sqlExec returning real row
+ * sets (including BLOB columns), schedule-kind dispatches, and streamed
+ * SSE responses piped across the facet and RPC boundaries.
+ *
+ * The hammer (DO alarms every ~20s per instance) keeps all of it running
+ * around the clock — every alarm on an evicted instance is a genuine
+ * hibernation wake + facet reboot, the restart-from-idle shape production
+ * wedges follow. Strip pieces out once it reproduces.
  */
 
 const DESERIALIZE_NEEDLE = "Unable to deserialize cloned data";
+const RESET_NEEDLE = "caused object to be reset";
 const COMPATIBILITY_DATE = "2026-04-17";
 const CONTEXT_HEADERS = {
   appId: "x-sauna-app-id",
@@ -89,7 +96,7 @@ const ENV_SOURCE = `export function buildEnv(app) {
       raw: (s, params) => {
         const cursor = sqlStorage.exec(s, ...(params || []));
         const rows = [...cursor.raw()];
-        return { columns: cursor.columnNames, rows };
+        return { columns: cursor.columnNames, rows: rows };
       },
     },
   };
@@ -113,6 +120,7 @@ const MIGRATIONS_SOURCE = `const MIGRATIONS = [
   "CREATE TABLE IF NOT EXISTS items (id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT NOT NULL, amount REAL NOT NULL, created_at INTEGER NOT NULL)",
   "CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, payload TEXT NOT NULL, at INTEGER NOT NULL)",
   "CREATE INDEX IF NOT EXISTS idx_events_kind_at ON events (kind, at)",
+  "CREATE TABLE IF NOT EXISTS blobs (id INTEGER PRIMARY KEY AUTOINCREMENT, data BLOB NOT NULL, at INTEGER NOT NULL)",
 ];
 
 export async function applyMigrations(storage) {
@@ -134,13 +142,33 @@ export async function applyMigrations(storage) {
 `;
 
 /**
- * A user handler doing meaningful work: bulk writes, row-returning reads,
- * console.log on every request (drives the tail -> ingestLogs channel),
- * and an outbound fetch (drives globalOutbound).
+ * A user handler doing meaningful work: bulk writes, BLOB writes/reads,
+ * row-returning reads, an SSE stream, a seed route for building real state
+ * size, an onSchedule task, console.log on every request (drives the
+ * tail -> ingestLogs channel), and an outbound fetch (globalOutbound).
  */
 const HANDLER_SOURCE = `import { PAD } from "./pad.js";
+import { PAD2 } from "./pad2.js";
+import { PAD3 } from "./pad3.js";
+
+const bulkWrite = (env, n, kind) => {
+  for (let i = 0; i < n; i++) {
+    env.sql.exec(
+      "INSERT INTO events (kind, payload, at) VALUES (?, ?, ?)",
+      [kind, JSON.stringify({ i: i, blob: "x".repeat(200) }), Date.now()],
+    );
+  }
+};
 
 export default {
+  async onSchedule(env, ctx) {
+    console.log("[app] onSchedule tick");
+    bulkWrite(env, 20, "schedule");
+    env.sql.query(
+      "SELECT kind, COUNT(*) AS n FROM events GROUP BY kind ORDER BY n DESC",
+    );
+  },
+
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     console.log("[app] " + request.method + " " + url.pathname);
@@ -161,24 +189,82 @@ export default {
     }
     if (url.pathname === "/api/bulk" && request.method === "POST") {
       const body = await request.json();
-      const n = body.n || 40;
-      for (let i = 0; i < n; i++) {
-        env.sql.exec(
-          "INSERT INTO events (kind, payload, at) VALUES (?, ?, ?)",
-          ["bulk", JSON.stringify({ i: i, blob: "x".repeat(200) }), Date.now()],
-        );
-      }
+      bulkWrite(env, body.n || 40, "bulk");
       const agg = env.sql.query(
         "SELECT kind, COUNT(*) AS n, MAX(at) AS latest FROM events GROUP BY kind",
       );
-      console.log("[app] bulk wrote " + n + " events");
+      console.log("[app] bulk wrote " + (body.n || 40) + " events");
       return Response.json({ ok: true, agg: agg });
+    }
+    if (url.pathname === "/api/blob" && request.method === "POST") {
+      const body = await request.json();
+      const n = body.n || 4;
+      const kb = body.kb || 16;
+      for (let i = 0; i < n; i++) {
+        const bytes = new Uint8Array(kb * 1024);
+        crypto.getRandomValues(bytes);
+        env.sql.exec("INSERT INTO blobs (data, at) VALUES (?, ?)", [
+          bytes.buffer,
+          Date.now(),
+        ]);
+      }
+      return Response.json({ ok: true, wrote: n, kb: kb });
+    }
+    if (url.pathname === "/api/blob") {
+      const rows = env.sql.query(
+        "SELECT id, data, at FROM blobs ORDER BY id DESC LIMIT 8",
+      );
+      let bytes = 0;
+      for (const row of rows) {
+        bytes += row.data.byteLength || 0;
+      }
+      return Response.json({ ok: true, rows: rows.length, bytes: bytes });
+    }
+    if (url.pathname === "/api/seed" && request.method === "POST") {
+      const body = await request.json();
+      const n = body.n || 1000;
+      for (let i = 0; i < n; i++) {
+        env.sql.exec(
+          "INSERT INTO events (kind, payload, at) VALUES (?, ?, ?)",
+          ["seed", "s".repeat(800), Date.now()],
+        );
+        if (i % 20 === 0) {
+          const bytes = new Uint8Array(8 * 1024);
+          crypto.getRandomValues(bytes);
+          env.sql.exec("INSERT INTO blobs (data, at) VALUES (?, ?)", [
+            bytes.buffer,
+            Date.now(),
+          ]);
+        }
+      }
+      const total = env.sql.query("SELECT COUNT(*) AS n FROM events");
+      return Response.json({ ok: true, events: total[0].n });
+    }
+    if (url.pathname === "/api/stream") {
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream({
+        async start(controller) {
+          for (let i = 0; i < 12; i++) {
+            controller.enqueue(
+              encoder.encode("data: chunk-" + i + " " + "y".repeat(256) + "\\n\\n"),
+            );
+            await new Promise((resolve) => setTimeout(resolve, 40));
+          }
+          controller.close();
+        },
+      });
+      return new Response(stream, {
+        headers: { "content-type": "text/event-stream" },
+      });
     }
     if (url.pathname === "/api/out") {
       const res = await fetch("https://example.com/ping");
       return Response.json({ ok: true, upstream: res.status });
     }
-    return Response.json({ ok: true, pad: PAD.length });
+    return Response.json({
+      ok: true,
+      pad: PAD.length + PAD2.length + PAD3.length,
+    });
   },
 };
 `;
@@ -269,8 +355,7 @@ export class App extends DurableObject {
   async fetch(request) {
     const input = __inputFromRequest(request);
     if (request.headers.get(CONTEXT_HEADERS.dispatchKind) === "schedule") {
-      await this.__bootIfNeeded();
-      recordInput(this, input);
+      await this.__dispatchSchedule(input);
       return new Response(null, { status: 204 });
     }
     return this.__dispatch(__stripContextHeaders(request), input);
@@ -283,6 +368,13 @@ export class App extends DurableObject {
       return new Response("handler does not export fetch", { status: 501 });
     }
     return handler.fetch(request, buildEnv(this), buildCtx(this, input));
+  }
+
+  async __dispatchSchedule(input) {
+    await this.__bootIfNeeded();
+    recordInput(this, input);
+    if (typeof handler.onSchedule !== "function") return;
+    await handler.onSchedule(buildEnv(this), buildCtx(this, input));
   }
 
   async __sqlExec(stmt, params, maxRows) {
@@ -313,9 +405,13 @@ export default {
 };
 `;
 
-/** ~256KB inert module: real bundles are multi-module and non-trivial to
- * compile, which widens the facet boot window. */
-const PAD_SOURCE = `export const PAD = ${JSON.stringify("x".repeat(262_144))};`;
+/** Three ~512KB inert modules: real bundles are multi-module and
+ * non-trivial to compile, which widens the facet boot window. */
+const padModule = (name) =>
+  `export const ${name} = ${JSON.stringify("x".repeat(524_288))};`;
+const PAD_SOURCE = padModule("PAD");
+const PAD2_SOURCE = padModule("PAD2");
+const PAD3_SOURCE = padModule("PAD3");
 
 const buildModules = () => ({
   "wrapper.js": WRAPPER_SOURCE,
@@ -324,6 +420,8 @@ const buildModules = () => ({
   "input.js": INPUT_SOURCE,
   "migrations.js": MIGRATIONS_SOURCE,
   "pad.js": PAD_SOURCE,
+  "pad2.js": PAD2_SOURCE,
+  "pad3.js": PAD3_SOURCE,
 });
 
 /* ──────────────────── loopback entrypoints (vendored from gateway/) ─────────────────── */
@@ -432,6 +530,14 @@ const withFacetRecovery = async (abortFacet, call) => {
   }
 };
 
+const withTimeout = (promise, ms) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`TIMEOUT after ${ms}ms`)), ms),
+    ),
+  ]);
+
 export class SaunaSupervisor extends DurableObject {
   constructor(state, env) {
     super(state, env);
@@ -470,8 +576,11 @@ export class SaunaSupervisor extends DurableObject {
             userId: "repro-user",
             appId,
             organizationId: "repro-org",
-            accounts: [],
-            connections: [],
+            accounts: [
+              { id: "acct_1", provider: "google", scopes: ["a", "b"] },
+              { id: "acct_2", provider: "notion", scopes: ["c"] },
+            ],
+            connections: [{ id: "conn_1", kind: "postgres", label: "main" }],
           },
         }),
         tails: [
@@ -495,7 +604,7 @@ export class SaunaSupervisor extends DurableObject {
     this.abortAppFacet("redeploy");
     this.codeVersion += 1;
     await this.getFacet(appId).fetch(
-      this.#contextRequest(appId, "GET", "/", null, "http"),
+      this.#contextRequest(appId, "GET", "/", null, "http").request,
     );
     return { codeVersion: this.codeVersion };
   }
@@ -517,52 +626,83 @@ export class SaunaSupervisor extends DurableObject {
       headers,
       body: body ?? undefined,
     });
-    request.__invocationId = invocationId;
-    return request;
+    return { request, invocationId };
   }
 
   async dispatch(input) {
     const startedAt = Date.now();
-    const request = this.#contextRequest(
-      input.appId,
-      input.method,
-      input.path,
-      input.body ? JSON.stringify(input.body) : null,
-      "http",
-    );
-    const invocationId = request.__invocationId;
+    const kind = input.kind ?? "http";
+    const body = input.body ? JSON.stringify(input.body) : null;
+    const first = this.#contextRequest(input.appId, input.method, input.path, body, kind);
+    const invocationId = first.invocationId;
     this.ctx.storage.sql.exec(
       "INSERT INTO invocations (id, at, kind, route, ok) VALUES (?, ?, ?, ?, 0)",
       invocationId,
       startedAt,
-      "http",
+      kind,
       input.path,
     );
     let response;
-    let errorMessage = null;
     try {
-      const body = input.body ? JSON.stringify(input.body) : null;
+      let attempt = 0;
       response = await withFacetRecovery(
         (reason) => this.abortAppFacet(reason),
-        () =>
-          this.getFacet(input.appId).fetch(
-            this.#contextRequest(input.appId, input.method, input.path, body, "http"),
-          ),
+        () => {
+          attempt += 1;
+          const built =
+            attempt === 1
+              ? first
+              : this.#contextRequest(input.appId, input.method, input.path, body, kind);
+          return this.getFacet(input.appId).fetch(built.request);
+        },
       );
     } catch (err) {
-      errorMessage = err instanceof Error ? err.message : String(err);
+      const errorMessage = err instanceof Error ? err.message : String(err);
       await this.#finishInvocation(invocationId, false, errorMessage, startedAt);
       await this.#markLastError(errorMessage);
       throw err;
     }
-    const bodyBuffer = await response.arrayBuffer();
+    /**
+     * Streamed responses cross the RPC boundary as a live stream through
+     * an IdentityTransformStream, mirroring streamSerializedResponse.
+     */
+    const contentType = response.headers.get("content-type") ?? "";
     const headers = [];
     response.headers.forEach((v, k) => {
       headers.push([k, v]);
     });
+    if (response.body && contentType.includes("text/event-stream")) {
+      const { readable, writable } = new IdentityTransformStream();
+      this.ctx.waitUntil(
+        response.body
+          .pipeTo(writable)
+          .then(() => this.#finishInvocation(invocationId, true, null, startedAt))
+          .catch((err) =>
+            this.#finishInvocation(
+              invocationId,
+              false,
+              `stream ended early: ${err instanceof Error ? err.message : err}`,
+              startedAt,
+            ),
+          ),
+      );
+      return { status: response.status, headers, stream: readable };
+    }
+    const bodyBuffer = await response.arrayBuffer();
     const ok = response.status >= 200 && response.status < 300;
     await this.#finishInvocation(invocationId, ok, null, startedAt);
     return { status: response.status, headers, body: bodyBuffer };
+  }
+
+  /** Scheduled-task shape: production wedge timestamps cluster on the
+   * quarter-hour boundaries these fire on. */
+  async scheduleDispatch(appId) {
+    return await this.dispatch({
+      appId,
+      method: "POST",
+      path: "/__schedule",
+      kind: "schedule",
+    });
   }
 
   async queryDb(input) {
@@ -629,7 +769,7 @@ export class SaunaSupervisor extends DurableObject {
     );
   }
 
-  async stats() {
+  async stats(appId) {
     const logs = this.ctx.storage.sql
       .exec("SELECT COUNT(*) AS n FROM worker_logs")
       .toArray()[0].n;
@@ -639,13 +779,156 @@ export class SaunaSupervisor extends DurableObject {
     const lastError = this.ctx.storage.sql
       .exec("SELECT v FROM meta WHERE k = 'lastError'")
       .toArray();
+    const hammerCfg = await this.ctx.storage.get("hammer");
+    const facetEvents = await this.queryDb({
+      appId: appId ?? hammerCfg?.appId ?? "stats-probe",
+      sql: "SELECT COUNT(*) AS n FROM events",
+      params: [],
+      limit: 1,
+    }).catch((err) => ({ error: String(err?.message ?? err) }));
     return {
       workerLogs: logs,
       invocations: invocations.n,
       invocationsOk: invocations.ok,
       lastError: lastError[0]?.v ?? null,
       codeVersion: this.codeVersion,
+      facetEvents: facetEvents.rows?.[0]?.n ?? facetEvents.error,
+      hammer: (await this.ctx.storage.get("hammer")) ?? null,
+      hammerStats: (await this.ctx.storage.get("hammer-stats")) ?? null,
     };
+  }
+
+  /* ──────────── the hammer: self-driving load via DO alarms ──────────── */
+
+  async startHammer(cfg) {
+    await this.ctx.storage.put("hammer", {
+      appId: cfg.appId,
+      intervalMs: cfg.intervalMs ?? 20_000,
+      redeployEvery: cfg.redeployEvery ?? 8,
+    });
+    await this.ctx.storage.setAlarm(Date.now() + 1_000);
+    return { on: true };
+  }
+
+  async stopHammer() {
+    await this.ctx.storage.delete("hammer");
+    await this.ctx.storage.deleteAlarm();
+    return { on: false };
+  }
+
+  async #drainStream(appId) {
+    const result = await this.dispatch({ appId, method: "GET", path: "/api/stream" });
+    if (result.stream) {
+      const reader = result.stream.getReader();
+      for (;;) {
+        const { done } = await reader.read();
+        if (done) break;
+      }
+    }
+    return result;
+  }
+
+  /**
+   * One compact production-shaped round against this instance. Alarms on
+   * an evicted instance are genuine hibernation wakes: constructor,
+   * facet reboot, migration-journal check — the restart-from-idle shape
+   * production wedges follow. Never throws; never stops rescheduling.
+   */
+  async alarm() {
+    const cfg = await this.ctx.storage.get("hammer");
+    if (!cfg) {
+      return;
+    }
+    const stats = (await this.ctx.storage.get("hammer-stats")) ?? {
+      runs: 0,
+      outcomes: 0,
+      ok: 0,
+      deserialize: 0,
+      resets: 0,
+      otherErrors: 0,
+      hits: [],
+      lastRunAt: null,
+    };
+    stats.runs += 1;
+    stats.lastRunAt = new Date().toISOString();
+    const appId = cfg.appId;
+    const outcomes = [];
+    const record = async (promise) => {
+      try {
+        await withTimeout(promise, 25_000);
+        outcomes.push("ok");
+      } catch (err) {
+        outcomes.push(`ERROR: ${err instanceof Error ? err.message : err}`);
+      }
+    };
+    try {
+      /**
+       * Waves of <=4: the alarm is a single request context, and >4
+       * concurrent dynamic-worker invocations per context trip a loader
+       * cap production never hits (each dispatch has its own context).
+       */
+      await Promise.all([
+        record(this.scheduleDispatch(appId)),
+        record(this.dispatch({ appId, method: "POST", path: "/api/bulk", body: { n: 30 } })),
+        record(this.dispatch({ appId, method: "POST", path: "/api/blob", body: { n: 3, kb: 24 } })),
+        record(this.dispatch({ appId, method: "GET", path: "/api/items" })),
+      ]);
+      await Promise.all([
+        record(this.dispatch({ appId, method: "GET", path: "/api/out" })),
+        record(this.#drainStream(appId)),
+        record(this.queryDb({ appId, sql: "SELECT id, data, at FROM blobs ORDER BY id DESC LIMIT 8", params: [], limit: 8 })),
+        record(this.queryDb({ appId, sql: "SELECT id, kind, payload, at FROM events ORDER BY id DESC LIMIT 25", params: [], limit: 25 })),
+      ]);
+      await record(this.queryDb({ appId, sql: "INSERT INTO events (kind, payload, at) VALUES (?, ?, ?)", params: ["hammer", "h".repeat(300), Date.now()] }));
+      if (stats.runs % cfg.redeployEvery === 0) {
+        await record(this.redeploy(appId));
+      }
+      /** Keep state large but bounded: prune far tails every 50 runs. */
+      if (stats.runs % 50 === 0) {
+        await record(
+          this.queryDb({
+            appId,
+            sql: "DELETE FROM events WHERE id < (SELECT COALESCE(MAX(id),0) FROM events) - 60000",
+            params: [],
+          }),
+        );
+        await record(
+          this.queryDb({
+            appId,
+            sql: "DELETE FROM blobs WHERE id < (SELECT COALESCE(MAX(id),0) FROM blobs) - 2000",
+            params: [],
+          }),
+        );
+        this.ctx.storage.sql.exec(
+          "DELETE FROM worker_logs WHERE id < (SELECT COALESCE(MAX(id),0) FROM worker_logs) - 20000",
+        );
+        this.ctx.storage.sql.exec(
+          "DELETE FROM invocations WHERE at < ?",
+          Date.now() - 6 * 3_600_000,
+        );
+      }
+    } catch (err) {
+      outcomes.push(`ALARM ERROR: ${err instanceof Error ? err.message : err}`);
+    }
+    for (const outcome of outcomes) {
+      stats.outcomes += 1;
+      if (outcome === "ok") {
+        stats.ok += 1;
+      } else if (outcome.includes(DESERIALIZE_NEEDLE)) {
+        stats.deserialize += 1;
+        stats.hits = [
+          ...stats.hits.slice(-19),
+          { at: stats.lastRunAt, outcome: outcome.slice(0, 300) },
+        ];
+        console.error("SAUNA HAMMER HIT", appId, outcome.slice(0, 300));
+      } else if (outcome.includes(RESET_NEEDLE)) {
+        stats.resets += 1;
+      } else {
+        stats.otherErrors += 1;
+      }
+    }
+    await this.ctx.storage.put("hammer-stats", stats);
+    await this.ctx.storage.setAlarm(Date.now() + cfg.intervalMs);
   }
 
   async #finishInvocation(id, ok, errorMessage, startedAt) {
@@ -672,17 +955,17 @@ export class SaunaSupervisor extends DurableObject {
 
 /* ──────────────────── the driver (an agent-shaped user) ─────────────────── */
 
-const withTimeout = (promise, ms) =>
-  Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      setTimeout(() => reject(new Error(`TIMEOUT after ${ms}ms`)), ms),
-    ),
-  ]);
-
 const outcomeOf = async (promise) => {
   try {
     const result = await withTimeout(promise, 20_000);
+    if (result && result.stream) {
+      const reader = result.stream.getReader();
+      for (;;) {
+        const { done } = await reader.read();
+        if (done) break;
+      }
+      return `stream:${result.status}`;
+    }
     if (result && typeof result.status === "number") {
       return `http:${result.status}`;
     }
@@ -694,10 +977,10 @@ const outcomeOf = async (promise) => {
 
 /**
  * One "someone is actually using the app" round: a burst of concurrent
- * dispatches (bulk writes, row reads, an outbound fetch) interleaved with
- * agent-shaped db/query calls, every dispatch also firing tail logs back
- * into the DO. Optionally a redeploy mid-burst (deploys correlate with
- * production wedges).
+ * dispatches (bulk writes, blob writes/reads, row reads, an SSE stream,
+ * an outbound fetch, a schedule tick) interleaved with agent-shaped
+ * db/query calls, every dispatch also firing tail logs back into the DO.
+ * Optionally a redeploy mid-burst.
  */
 export const runSaunaUse = async (env, opts) => {
   const name = opts.name ?? "sauna-1";
@@ -711,10 +994,13 @@ export const runSaunaUse = async (env, opts) => {
     ops.push(
       outcomeOf(stub.dispatch({ appId: name, method: "POST", path: "/api/bulk", body: { n: 40 } })),
       outcomeOf(stub.dispatch({ appId: name, method: "GET", path: "/api/items" })),
-      outcomeOf(stub.dispatch({ appId: name, method: "POST", path: "/api/items", body: { label: `r${round}-${i}`, amount: i * 1.5 } })),
+      outcomeOf(stub.dispatch({ appId: name, method: "POST", path: "/api/blob", body: { n: 2, kb: 16 } })),
+      outcomeOf(stub.dispatch({ appId: name, method: "GET", path: "/api/stream" })),
       outcomeOf(stub.dispatch({ appId: name, method: "GET", path: "/api/out" })),
+      outcomeOf(stub.scheduleDispatch(name)),
       outcomeOf(stub.queryDb({ appId: name, sql: "INSERT INTO events (kind, payload, at) VALUES (?, ?, ?)", params: ["agent", JSON.stringify({ round, i }), Date.now()] })),
       outcomeOf(stub.queryDb({ appId: name, sql: "SELECT id, kind, payload, at FROM events ORDER BY id DESC LIMIT 25", params: [], limit: 25 })),
+      outcomeOf(stub.queryDb({ appId: name, sql: "SELECT id, data, at FROM blobs ORDER BY id DESC LIMIT 8", params: [], limit: 8 })),
     );
   }
   if (redeployEvery > 0 && round % redeployEvery === redeployEvery - 1) {
@@ -742,10 +1028,80 @@ export const saunaRoutes = async (url, env) => {
         }
       }
       const stub = env.SAUNA_SUP.get(env.SAUNA_SUP.idFromName(name));
-      const stats = await stub.stats().catch((err) => ({
+      const stats = await stub.stats(name).catch((err) => ({
         statsError: String(err?.message ?? err),
       }));
       return Response.json({ name, rounds, burst, deserialize, tally, stats });
+    }
+    case "/sauna/seed": {
+      const rows = Number(url.searchParams.get("rows") ?? 20_000);
+      const stub = env.SAUNA_SUP.get(env.SAUNA_SUP.idFromName(name));
+      const perCall = 2_000;
+      let seeded = 0;
+      for (let i = 0; i < Math.ceil(rows / perCall); i++) {
+        const result = await stub.dispatch({
+          appId: name,
+          method: "POST",
+          path: "/api/seed",
+          body: { n: perCall },
+        });
+        if (result.status !== 200) {
+          return Response.json({ name, seeded, failedAt: result.status });
+        }
+        seeded += perCall;
+      }
+      return Response.json({ name, seeded });
+    }
+    case "/sauna/hammer": {
+      const on = url.searchParams.get("on") !== "0";
+      const fleet = Number(url.searchParams.get("fleet") ?? 0);
+      const intervalMs = Number(url.searchParams.get("intervalMs") ?? 20_000);
+      const redeployEvery = Number(url.searchParams.get("redeployEvery") ?? 8);
+      const names = fleet > 0
+        ? Array.from({ length: fleet }, (_, i) => `sauna-hammer-${i + 1}`)
+        : [name];
+      const results = {};
+      for (const target of names) {
+        const stub = env.SAUNA_SUP.get(env.SAUNA_SUP.idFromName(target));
+        results[target] = on
+          ? await stub.startHammer({ appId: target, intervalMs, redeployEvery })
+          : await stub.stopHammer();
+      }
+      return Response.json(results);
+    }
+    case "/sauna/fleet": {
+      const n = Number(url.searchParams.get("n") ?? 12);
+      const fleet = {};
+      const totals = { runs: 0, outcomes: 0, ok: 0, deserialize: 0, resets: 0, otherErrors: 0 };
+      for (let i = 1; i <= n; i++) {
+        const target = `sauna-hammer-${i}`;
+        const stub = env.SAUNA_SUP.get(env.SAUNA_SUP.idFromName(target));
+        try {
+          const stats = await withTimeout(stub.stats(target), 15_000);
+          const h = stats.hammerStats;
+          fleet[target] = {
+            runs: h?.runs ?? 0,
+            deserialize: h?.deserialize ?? 0,
+            resets: h?.resets ?? 0,
+            otherErrors: h?.otherErrors ?? 0,
+            lastRunAt: h?.lastRunAt ?? null,
+            facetEvents: stats.facetEvents,
+            lastError: stats.lastError,
+            hits: h?.hits?.length ? h.hits : undefined,
+          };
+          if (h) {
+            totals.runs += h.runs;
+            totals.outcomes += h.outcomes;
+            totals.ok += h.ok;
+            totals.deserialize += h.deserialize;
+            totals.resets += h.resets;
+            totals.otherErrors += h.otherErrors;
+          }
+        } catch (err) {
+          fleet[target] = { error: String(err?.message ?? err) };
+        }
+      }
+      return Response.json({ totals, fleet });
     }
     case "/sauna/verify": {
       const stub = env.SAUNA_SUP.get(env.SAUNA_SUP.idFromName(name));
@@ -763,7 +1119,7 @@ export const saunaRoutes = async (url, env) => {
     }
     case "/sauna/stats": {
       const stub = env.SAUNA_SUP.get(env.SAUNA_SUP.idFromName(name));
-      return Response.json(await stub.stats());
+      return Response.json(await stub.stats(name));
     }
     default:
       return null;

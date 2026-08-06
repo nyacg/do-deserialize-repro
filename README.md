@@ -283,6 +283,55 @@ missing conversion from "storage reset" to "poisoned deserialize state"
 may need production's state sizes, its workerd build, or an unlucky
 timing this harness hasn't hit yet; the cron keeps rolling the dice.
 
+## REPRODUCED ON DEMAND (2026-08-06): the trigger is account config propagation
+
+**Recipe** (verified three independent times in one day):
+
+1. Run a worker with supervisor-shaped DOs actively using Worker Loader
+   facets (the hammer fleet below — production-shaped dispatch/db-query
+   traffic keeping facet channels warm).
+2. Deploy **or delete any other worker in the same Cloudflare account**
+   (`/tmp`-grade dummy worker suffices; the affected worker itself is not
+   touched).
+3. Within seconds to ~3 minutes, active DO instances of the *untouched*
+   worker start failing every facet call with
+   `Unable to deserialize cloned data due to invalid or unsupported
+   version.` — dispatch and `__sqlExec` both, while the DO's own RPC and
+   SQLite stay healthy. Severity varies per wave: transient (one round)
+   to sticky 15–30 minutes, surviving `facets.abort()` + retry, cured
+   only by instance replacement/eviction.
+
+Observed waves: 05:06 UTC (trigger: `wrangler delete` of a sibling
+worker → 13/24 instances, sticky, staggered onsets 05:06→05:21),
+21:27 (dummy deploy → 12 instances, sticky ~1–3 min at 20s cadence),
+21:40 (dummy redeploy, zero fleet-side actions in flight → 3 instances
+including two idle-cadence ones, transient). Control: with no account
+config change, identical fleet activity ran clean for 16 hours
+(~50k outcomes) — and reconfigure/cadence changes alone do nothing on a
+freshly deployed version.
+
+**Why production sees it "fairly soon on any app you actually use":**
+the production account deploys workers many times a day (the apps worker
+itself ~2x/day, plus every other service). Each such config propagation
+can wedge the supervisors of whatever apps hold *warm facet channels* at
+that moment — i.e. exactly the apps someone is using. Deploying the apps
+worker itself replaces its DO instances (cure), which is why wedges
+appear to "persist until redeploy". Scheduled-task alarms clustering on
+quarter-hours gave the earlier boundary correlation: they are the
+facet activity that notices the poison.
+
+Mechanism (hypothesis, for Cloudflare): config propagation
+rotates/invalidates account-level state in the dynamic-loader / facet
+pipeline while warm channels still hold references from the previous
+epoch; subsequent facet dispatches deserialize against mismatched
+tables and surface V8's version error. Which boot-config channel is
+required is not yet bisected — the 21:40 wave hit a `no-outbound`
+instance, so `globalOutbound` at least is not necessary.
+
+The trigger worker lives at `/tmp`-equivalent simplicity: any
+`wrangler deploy` in the account. `churn-trigger-dummy` is kept in the
+account as the trigger tool.
+
 ## What triggers it in production — eliminations (2026-08-06)
 
 ClickHouse `app_supervisor_meta` for the apps that wedged on 2026-08-05:

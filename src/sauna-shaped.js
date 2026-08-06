@@ -556,22 +556,31 @@ export class SaunaSupervisor extends DurableObject {
     });
   }
 
+  /**
+   * facetMode strips boot-config pieces to isolate the wedge channel:
+   * full | no-tails | no-outbound | no-platform | bare. Mode is part of
+   * the runtime id so cached loader workers never cross modes.
+   */
   getFacet(appId) {
+    const mode = this.facetMode ?? "full";
     const exportsAny = this.ctx.exports;
-    const runtimeId = `${appId}-v${this.codeVersion}`;
+    const runtimeId = `${appId}-v${this.codeVersion}-${mode}`;
     return this.ctx.facets.get("app", async () => {
-      const platformEnv = {
-        APP_PLATFORM: exportsAny.AppInvocationControl({
-          props: { userId: "repro-user", appId },
-        }),
-      };
-      const loaded = this.env.LOADER.get(runtimeId, async () => ({
+      const config = {
         compatibilityDate: COMPATIBILITY_DATE,
         compatibilityFlags: ["nodejs_compat", "global_fetch_strictly_public"],
         mainModule: "wrapper.js",
         modules: buildModules(),
-        env: platformEnv,
-        globalOutbound: exportsAny.AppPipedreamProxy({
+      };
+      if (mode !== "bare" && mode !== "no-platform") {
+        config.env = {
+          APP_PLATFORM: exportsAny.AppInvocationControl({
+            props: { userId: "repro-user", appId },
+          }),
+        };
+      }
+      if (mode !== "bare" && mode !== "no-outbound") {
+        config.globalOutbound = exportsAny.AppPipedreamProxy({
           props: {
             userId: "repro-user",
             appId,
@@ -582,11 +591,14 @@ export class SaunaSupervisor extends DurableObject {
             ],
             connections: [{ id: "conn_1", kind: "postgres", label: "main" }],
           },
-        }),
-        tails: [
+        });
+      }
+      if (mode !== "bare" && mode !== "no-tails") {
+        config.tails = [
           exportsAny.AppLogTail({ props: { userId: "repro-user", appId } }),
-        ],
-      }));
+        ];
+      }
+      const loaded = this.env.LOADER.get(runtimeId, async () => config);
       return { class: loaded.getDurableObjectClass("App") };
     });
   }
@@ -805,6 +817,7 @@ export class SaunaSupervisor extends DurableObject {
       appId: cfg.appId,
       intervalMs: cfg.intervalMs ?? 20_000,
       redeployEvery: cfg.redeployEvery ?? 8,
+      facetMode: cfg.facetMode ?? "full",
     });
     await this.ctx.storage.setAlarm(Date.now() + 1_000);
     return { on: true };
@@ -852,6 +865,7 @@ export class SaunaSupervisor extends DurableObject {
     stats.runs += 1;
     stats.lastRunAt = new Date().toISOString();
     const appId = cfg.appId;
+    this.facetMode = cfg.facetMode ?? "full";
     const outcomes = [];
     const record = async (promise) => {
       try {
@@ -1057,6 +1071,7 @@ export const saunaRoutes = async (url, env) => {
       const fleet = Number(url.searchParams.get("fleet") ?? 0);
       const intervalMs = Number(url.searchParams.get("intervalMs") ?? 20_000);
       const redeployEvery = Number(url.searchParams.get("redeployEvery") ?? 8);
+      const facetMode = url.searchParams.get("facetMode") ?? "full";
       const names = fleet > 0
         ? Array.from({ length: fleet }, (_, i) => `sauna-hammer-${i + 1}`)
         : [name];
@@ -1064,7 +1079,7 @@ export const saunaRoutes = async (url, env) => {
       for (const target of names) {
         const stub = env.SAUNA_SUP.get(env.SAUNA_SUP.idFromName(target));
         results[target] = on
-          ? await stub.startHammer({ appId: target, intervalMs, redeployEvery })
+          ? await stub.startHammer({ appId: target, intervalMs, redeployEvery, facetMode })
           : await stub.stopHammer();
       }
       return Response.json(results);
@@ -1085,6 +1100,7 @@ export const saunaRoutes = async (url, env) => {
             resets: h?.resets ?? 0,
             otherErrors: h?.otherErrors ?? 0,
             lastRunAt: h?.lastRunAt ?? null,
+            mode: (await stub.stats(target).catch(() => null))?.hammer?.facetMode,
             facetEvents: stats.facetEvents,
             lastError: stats.lastError,
             hits: h?.hits?.length ? h.hits : undefined,

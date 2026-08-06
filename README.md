@@ -182,6 +182,56 @@ Each result carries `coldBoot`, measured idle minutes, the hop that failed
 and whether the error was the deserialize one, so edge blips and the real
 wedge stay distinguishable. Throughput is ~2 cold starts/minute (~3k/day).
 
+## Abort-churn probe (2026-08-05: what production actually settled)
+
+The first day of exported DO logs (sauna PR #5208) pinned the failure to
+the **DO→facet hop** and killed the transport theories:
+
+- Every wedged call logs `hop=in_do` — the DO method body runs.
+- `withFacetRecovery` fires (`retried=true`) ~23×/day, and **23/23 retries
+  against a freshly booted facet failed with the identical error**
+  (`recovered=false`). The wedge survives facet recreation; only instance
+  discard or eviction clears it.
+- The reachability probe reads `reachable` on every episode — the DO
+  answers `getMeta` over the same worker↔DO boundary while the facet hop
+  fails.
+
+So the poison is **instance-level, in-memory, specific to the facet
+machinery** — and the one operation production performs on that machinery
+around every wedge is `ctx.facets.abort()` (deploys and the recovery path
+both call it, and #5195 independently showed it poisons hibernatable WS
+delivery). The churn probe tests whether the abort is also the *trigger*:
+
+- `/churn` — redeploy-under-traffic rounds: in-flight `slow()` calls into
+  facet A, `facets.abort()` mid-flight, immediately boot facet B (new code
+  id) and hammer it. `scripts/abort-churn.sh` drives it across instances
+  and abort timings.
+- `/stampede` — the concurrent shape (production logged two recovery
+  aborts in the same second): N workers loop call → on failure abort +
+  retry on the same code id (the `withFacetRecovery` shape), periodic
+  deploy-style aborts, boots stretched by `bootDelayMs` so aborts land
+  mid-boot.
+- The 5-minute cron runs one churn round + one stampede per tick across
+  six rotating instances and persists tallies in the registry —
+  `/churn/stats` — so a hit survives log retention.
+
+Results so far (2026-08-05):
+
+- **360 sequential abort-under-traffic rounds: zero deserialize outcomes.**
+  In-flight calls die with the abort reason, post-abort boots are clean.
+- **~2,500 stampede iterations: zero deserialize outcomes.** But the race
+  regime is real: aborts landing mid-boot produce opaque
+  `internal error; reference = …` failures (not clean abort rejections),
+  and >4 concurrent dynamic-worker invocations per request hit an
+  undocumented Worker Loader concurrency cap.
+
+So a bare abort/boot race does not mint the wedge at this scale, on this
+build, with a trivial facet. Untested ingredients production has and this
+probe does not: hibernatable WebSockets registered on the instance
+(#5195's poison target), multi-MB app bundles, facet SQLite of real size,
+and whatever build the wedged hosts run. The cron accumulates ~40k
+outcomes/day in the meantime.
+
 ## Hypotheses eliminated
 
 Each was tested on the real cross-process JSRPC hop and did **not**

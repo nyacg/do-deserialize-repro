@@ -164,7 +164,7 @@ every outcome to a registry DO's SQLite so a hit survives log retention.
 
 ```
 npx wrangler deploy -c wrangler.coldstart.jsonc
-curl https://do-coldstart-probe.sauna-dev.workers.dev/stats
+curl https://do-coldstart-probe.<subdomain>.workers.dev/stats
 ```
 
 Each result carries `coldBoot`, measured idle minutes, the hop that failed
@@ -325,14 +325,14 @@ account as the trigger tool.
 ## What triggers it in production — eliminations (2026-08-06)
 
 ClickHouse `app_supervisor_meta` for the apps that wedged on 2026-08-05:
-`sauna-home-v2` last deployed **07-06**, `sauna-home-d2ungulk` **07-05**,
-`ceo-desk` **07-04**, `expedition` **07-27** — apps that had not deployed
+`app-A` last deployed **07-06**, `app-B` **07-05**,
+`app-C` **07-04**, `app-D` **07-27** — apps that had not deployed
 in weeks wedged repeatedly. So the original onset is **not** app deploys
 (and earlier: not cold starts, not payload content, not concurrency, not
 `facets.abort()` races at n≈10k).
 
 Meanwhile every instrumented episode (post-#5208 DO logs, including
-`meego-support` on 2026-08-06 03:56 UTC with `phase=facet_call` captured
+`app-E` on 2026-08-06 03:56 UTC with `phase=facet_call` captured
 on the db_query path) shows the same thing: the **entire facet channel**
 of one DO instance dies — dispatch and `__sqlExec` both — while
 `getMeta`/`listLogs` on the same instance answer normally, retries

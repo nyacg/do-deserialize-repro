@@ -351,6 +351,25 @@ const runProbe = async (env) => {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
+    /**
+     * Load-generating routes are open on a fresh deploy (no PROBE_KEY
+     * set) but lockable on a long-lived public deployment: set the
+     * PROBE_KEY secret and callers must send it as x-probe-key.
+     */
+    const mutating = [
+      "/churn",
+      "/stampede",
+      "/sauna/use",
+      "/sauna/seed",
+      "/sauna/hammer",
+    ];
+    if (
+      env.PROBE_KEY &&
+      mutating.includes(url.pathname) &&
+      request.headers.get("x-probe-key") !== env.PROBE_KEY
+    ) {
+      return new Response("locked: send x-probe-key", { status: 403 });
+    }
     const stub = env.SUPERVISOR.get(env.SUPERVISOR.idFromName("probe"));
     try {
       if (url.pathname.startsWith("/sauna/")) {

@@ -6,7 +6,7 @@
 # persists on that instance the way production wedges do.
 set -euo pipefail
 
-BASE="${BASE:-https://do-deserialize-repro.sauna-dev.workers.dev}"
+BASE="${BASE:?set BASE=https://<worker>.workers.dev}"
 INSTANCES="${INSTANCES:-8}"
 SWEEPS="${SWEEPS:-3}"
 ROUNDS="${ROUNDS:-5}"

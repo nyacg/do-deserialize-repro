@@ -31,7 +31,7 @@ if [ "$MODE" != "trigger" ]; then
   sleep 15
   echo "== arming $N instances at 20s cadence"
   for i in $(seq 1 "$N"); do
-    curl -sf --max-time 30 "$BASE/sauna/hammer?name=repro-h-$i&on=1&intervalMs=20000&redeployEvery=999" > /dev/null
+    curl -sf --max-time 30 ${PROBE_KEY:+-H "x-probe-key: $PROBE_KEY"} "$BASE/sauna/hammer?name=repro-h-$i&on=1&intervalMs=20000&redeployEvery=999" > /dev/null
   done
 else
   : "${BASE:?trigger mode needs BASE=https://<worker>.workers.dev}"
@@ -72,7 +72,7 @@ import json,sys
 r=json.load(sys.stdin); h=r.get("hammerStats") or {}
 if h.get("deserialize"): print("  repro-h-'"$i"':", h["deserialize"], "hits, first:", (h.get("hits") or [{}])[0])'
     done
-    for i in $(seq 1 "$N"); do curl -s "$BASE/sauna/hammer?name=repro-h-$i&on=0" > /dev/null; done
+    for i in $(seq 1 "$N"); do curl -s ${PROBE_KEY:+-H "x-probe-key: $PROBE_KEY"} "$BASE/sauna/hammer?name=repro-h-$i&on=0" > /dev/null; done
     echo "instances stopped; delete workers with:"
     echo "  npx wrangler delete --name churn-trigger-dummy --force"
     exit 0
@@ -97,4 +97,4 @@ attempt "redeploy trigger worker" "cd '$here/trigger' && npx wrangler deploy"
 echo
 echo "NOT REPRODUCED this session — waves are machine-dependent; rerun, or"
 echo "leave the instances armed and deploy any other worker in the account."
-for i in $(seq 1 "$N"); do curl -s "$BASE/sauna/hammer?name=repro-h-$i&on=0" > /dev/null; done
+for i in $(seq 1 "$N"); do curl -s ${PROBE_KEY:+-H "x-probe-key: $PROBE_KEY"} "$BASE/sauna/hammer?name=repro-h-$i&on=0" > /dev/null; done

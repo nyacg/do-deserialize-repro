@@ -283,6 +283,52 @@ missing conversion from "storage reset" to "poisoned deserialize state"
 may need production's state sizes, its workerd build, or an unlucky
 timing this harness hasn't hit yet; the cron keeps rolling the dice.
 
+## What triggers it in production — eliminations (2026-08-06)
+
+ClickHouse `app_supervisor_meta` for the apps that wedged on 2026-08-05:
+`sauna-home-v2` last deployed **07-06**, `sauna-home-d2ungulk` **07-05**,
+`ceo-desk` **07-04**, `expedition` **07-27** — apps that had not deployed
+in weeks wedged repeatedly. So the original onset is **not** app deploys
+(and earlier: not cold starts, not payload content, not concurrency, not
+`facets.abort()` races at n≈10k).
+
+Meanwhile every instrumented episode (post-#5208 DO logs, including
+`meego-support` on 2026-08-06 03:56 UTC with `phase=facet_call` captured
+on the db_query path) shows the same thing: the **entire facet channel**
+of one DO instance dies — dispatch and `__sqlExec` both — while
+`getMeta`/`listLogs` on the same instance answer normally, retries
+against freshly booted facets fail 100% of the time, and the state is
+in-memory (eviction or instance replacement cures it).
+
+The hypothesis that fits everything remaining: **build skew between the
+DO's workerd process and the process pool hosting Worker Loader
+facets**, created when a Cloudflare fleet rollout passes under
+long-lived instances. That cannot be forced from user code — it can only
+be caught in the act, which is what the hammer fleet below is for. The
+sharpest counter-evidence to date is also recorded honestly: sauna's
+apps run in one process model and this repo's probes in the same one,
+and no local pair of published builds fails this hop.
+
+## The hammer fleet (self-driving, catches rollouts in the act)
+
+24 sauna-shaped instances drive themselves via DO alarms — 12 at 20s
+cadence, 12 at 60s — each alarm running a compact production-shaped
+round (schedule tick, bulk writes, blob write/read, row reads, SSE
+stream, outbound fetch, db/query, periodic redeploy) with hibernation
+wakes in between. Zero-cost to watch:
+
+```
+curl $BASE/sauna/fleet?n=24        # per-instance runs / resets / hits
+curl $BASE/sauna/accumulated       # cron-leg tallies
+curl $BASE/churn/stats             # abort-churn tallies
+curl "$BASE/sauna/hammer?fleet=24&on=0"   # teardown
+```
+
+A deserialize hit persists in the instance's own storage (`hits[]` with
+timestamps) and logs `SAUNA HAMMER HIT` to Workers Logs. If a rollout
+wedges any instance, the 20s cadence measures persistence and recovery
+timing automatically.
+
 ## Hypotheses eliminated
 
 Each was tested on the real cross-process JSRPC hop and did **not**

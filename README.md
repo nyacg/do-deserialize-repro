@@ -232,6 +232,57 @@ probe does not: hibernatable WebSockets registered on the instance
 and whatever build the wedged hosts run. The cron accumulates ~40k
 outcomes/day in the meantime.
 
+## Sauna-shaped reproduction (2026-08-05, closing the fidelity gap)
+
+`src/sauna-shaped.js`: a structural copy of the production apps runtime
+rather than a minimal probe — production wedges correlate with *real use*
+("a bunch of writes, actually using the app"), so every channel real use
+exercises is present:
+
+- `SaunaSupervisor` DO mirroring `app-supervisor.ts`: invocations /
+  worker_logs / meta SQLite writes bracketing every facet call,
+  `withFacetRecovery` (abort + retry), context headers, redeploy path
+  (facet abort + new runtime id).
+- The vendored wrapper (`wrapper-source.ts`): `blockConcurrencyWhile` boot
+  with DDL + a drizzle-shaped migration journal (re-runs on every
+  hibernation wake), `recordInput` facet-SQLite write on every dispatch,
+  verbatim `__sqlExec` returning row sets.
+- The loopback entrypoints from `facet.ts`: `AppInvocationControl` as the
+  facet's `env.APP_PLATFORM`, `AppPipedreamProxy` as `globalOutbound`,
+  and the `AppLogTail` tail worker — every app `console.log` re-enters
+  the same supervisor DO via `ingestLogs`, concurrently with dispatches.
+- A handler doing meaningful work: bulk inserts, row-returning reads,
+  outbound fetches, logs on every request; a 256KB pad module for
+  non-trivial compiles.
+
+Drive it: `/sauna/use?name=X&rounds=4&burst=4&redeployEvery=3`, check
+`/sauna/verify?name=X`, `/sauna/stats?name=X`; the cron adds two rounds
+per tick on six rotating instances (each idles ~25 min between turns, so
+hibernation wakes are covered) — accumulated in `/sauna/accumulated`.
+
+### Findings so far
+
+**~2,400 outcomes across 20 instances under heavy concurrent use with
+redeploys: zero deserialize errors — but a new failure mode:**
+
+```
+Internal error in Durable Object storage caused object to be reset;
+```
+
+Redeploy aborts racing in-flight bulk writes trip an internal error in
+the DO **storage layer**, and the platform resets the instance. It
+clusters hard per-instance (3 of 12 instances took 22–25 resets each;
+the other 9 took zero) and the reset destroys in-memory state (the
+supervisor's `codeVersion` reverts), i.e. the platform performs the
+equivalent of `ctx.abort()`. Every instance recovered afterwards.
+
+That chain — facet abort under write load → storage-layer internal error
+→ per-instance failure burst → cleared by instance replacement — has
+exactly the shape of the production wedge except the error string. The
+missing conversion from "storage reset" to "poisoned deserialize state"
+may need production's state sizes, its workerd build, or an unlucky
+timing this harness hasn't hit yet; the cron keeps rolling the dice.
+
 ## Hypotheses eliminated
 
 Each was tested on the real cross-process JSRPC hop and did **not**

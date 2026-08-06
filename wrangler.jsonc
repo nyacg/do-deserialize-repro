@@ -7,9 +7,15 @@
   "compatibility_date": "2026-04-17",
   "compatibility_flags": ["nodejs_compat"],
   "durable_objects": {
-    "bindings": [{ "name": "SUPERVISOR", "class_name": "Supervisor" }]
+    "bindings": [
+      { "name": "SUPERVISOR", "class_name": "Supervisor" },
+      { "name": "SAUNA_SUP", "class_name": "SaunaSupervisor" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Supervisor"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Supervisor"] },
+    { "tag": "v2", "new_sqlite_classes": ["SaunaSupervisor"] }
+  ],
   "worker_loaders": [{ "binding": "LOADER" }],
   "observability": { "enabled": true },
   "triggers": { "crons": ["*/5 * * * *"] }

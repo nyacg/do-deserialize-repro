@@ -1,4 +1,14 @@
 import { DurableObject } from "cloudflare:workers";
+import { runSaunaUse, saunaRoutes } from "./sauna-shaped.js";
+
+/** ctx.exports only sees top-level worker exports, so the sauna-shaped
+ * supervisor and its loopback entrypoints must be re-exported here. */
+export {
+  AppInvocationControl,
+  AppLogTail,
+  AppPipedreamProxy,
+  SaunaSupervisor,
+} from "./sauna-shaped.js";
 
 /**
  * Minimal stand-in for sauna's app facet (packages/apps-runtime
@@ -288,6 +298,27 @@ export class Supervisor extends DurableObject {
   async churnStats() {
     return (await this.ctx.storage.get("churn-stats")) ?? null;
   }
+
+  async recordSauna(summary) {
+    const stats = (await this.ctx.storage.get("sauna-stats")) ?? {
+      runs: 0,
+      outcomes: 0,
+      deserialize: 0,
+      hits: [],
+    };
+    stats.runs += 1;
+    stats.outcomes += summary.outcomes;
+    stats.deserialize += summary.deserialize;
+    if (summary.hit) {
+      stats.hits = [...stats.hits.slice(-19), summary.hit];
+    }
+    await this.ctx.storage.put("sauna-stats", stats);
+    return stats;
+  }
+
+  async saunaStats() {
+    return (await this.ctx.storage.get("sauna-stats")) ?? null;
+  }
 }
 
 const HOPS = {
@@ -322,6 +353,12 @@ export default {
     const url = new URL(request.url);
     const stub = env.SUPERVISOR.get(env.SUPERVISOR.idFromName("probe"));
     try {
+      if (url.pathname.startsWith("/sauna/")) {
+        const handled = await saunaRoutes(url, env);
+        if (handled) {
+          return handled;
+        }
+      }
       switch (url.pathname) {
         case "/probe":
           return Response.json(await runProbe(env));
@@ -388,6 +425,8 @@ export default {
         }
         case "/churn/stats":
           return Response.json(await stub.churnStats());
+        case "/sauna/accumulated":
+          return Response.json(await stub.saunaStats());
         case "/churn/verify": {
           /** Is this instance's facet path currently wedged? */
           const name = url.searchParams.get("name") ?? "churn-1";
@@ -468,6 +507,51 @@ export default {
     });
     if (deser.length > 0) {
       console.error("CHURN HIT", JSON.stringify({ name, samples: deser.slice(0, 3) }));
+    }
+
+    /**
+     * Sauna-shaped accumulation: two agent-usage rounds per tick against a
+     * rotating app instance (each instance idles ~25 min between turns, so
+     * hibernation wakes are exercised too), with a redeploy every 4th
+     * round — the full production channel set under realistic use.
+     */
+    const saunaName = `sauna-cron-${Math.floor(Date.now() / 300_000) % 6}`;
+    const saunaOutcomes = [];
+    for (let round = 0; round < 2; round++) {
+      try {
+        saunaOutcomes.push(
+          ...(await runSaunaUse(env, {
+            name: saunaName,
+            burst: 3,
+            redeployEvery: 4,
+            round: Math.floor(Date.now() / 300_000) + round,
+          })),
+        );
+      } catch (err) {
+        saunaOutcomes.push(
+          `CRON ERROR: ${err instanceof Error ? err.message : err}`,
+        );
+      }
+    }
+    const saunaDeser = saunaOutcomes.filter((o) =>
+      o.includes("Unable to deserialize cloned data"),
+    );
+    await registry.recordSauna({
+      outcomes: saunaOutcomes.length,
+      deserialize: saunaDeser.length,
+      hit: saunaDeser.length
+        ? {
+            at: new Date().toISOString(),
+            name: saunaName,
+            samples: saunaDeser.slice(0, 3),
+          }
+        : undefined,
+    });
+    if (saunaDeser.length > 0) {
+      console.error(
+        "SAUNA HIT",
+        JSON.stringify({ name: saunaName, samples: saunaDeser.slice(0, 3) }),
+      );
     }
   },
 };

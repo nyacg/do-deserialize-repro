@@ -1,429 +1,154 @@
 # do-deserialize-repro
 
-Minimal reproduction of the Durable Object wedge behind sauna SN-2367:
+Reproduction of a Durable Object failure mode on Cloudflare Workers:
+**deploying or deleting any worker in an account breaks the Worker Loader
+facet channels of *other, untouched* workers' active DO instances.** Every
+facet call on an affected instance — RPC methods and `fetch` alike — then
+fails with
 
 ```
 Unable to deserialize cloned data due to invalid or unsupported version.
 ```
 
-One plain-JS worker (`src/worker.js`, ~170 lines) mirrors every
-serialization hop of the sauna apps runtime, individually labeled, plus
-scripts that reproduce the error deterministically against workerd's own
-deserializer — on DO storage (`scripts/forge-version.sh`) and on the hop
-that actually wedged production (`scripts/rpc-forge.sh`).
+while the DO itself stays healthy (its own RPC methods, SQLite, and alarms
+all keep working). The wedge is in-memory and per-instance: it survives
+`ctx.facets.abort()` + re-`get()` (a **fresh facet fails identically**),
+and clears only when the DO instance is evicted or replaced. Severity per
+wave ranges from one failed round to 15–30 minutes stuck.
 
-Live probe: https://do-deserialize-repro.sauna-dev.workers.dev/probe —
-deployed in the sauna Cloudflare account, cron-probing every hop every 5
-minutes. Delete with `npx wrangler delete --name do-deserialize-repro`.
+In production (Wordware's app platform, ~900 DO-hosted apps) this fires
+multiple times daily and wedges whichever apps hold warm facet channels at
+the moment any account deploy propagates — i.e. exactly the apps users are
+actively using.
 
-## The mechanism
+## Reproduce it
 
-Every JS RPC argument/return crossing a worker↔DO boundary is V8-serialized.
-The wire format starts `[0xFF, formatVersion, ...]` and the deserializer
-rejects any header version newer than its own build supports — that
-rejection is this exact error. Within one process both sides share a build,
-so it can never fire locally; it fires when **two different workerd builds
-talk to each other**, which is what Cloudflare's staged runtime rollouts do
-to cross-machine worker↔DO RPC (edge fleet and DO hosts update at different
-times, and a long-lived DO can sit on a stale host for days).
-
-## The hops (matching sauna's runtime)
-
-| hop | sauna equivalent | verdict |
-|---|---|---|
-| `rpc_worker_to_do` | `AppSupervisor` RPC methods (pre-ADR-0030 `dispatch`/`queryDb`/`deployPrepared`) | **the vulnerable hop** — live V8 codec across machines |
-| `http_worker_to_do` | WS upgrades; post-ADR-0030 everything | control group — capnp HTTP, no V8 codec, immune |
-| `do_storage_kv` | DO storage / SQLite | safe — writes are **pinned** (observed: format version 15 written by an Aug 2026 build), so stale readers always succeed; data survives the wedge intact |
-| `do_to_facet` | `ctx.facets.get("app")` + Worker Loader (`apps/apps/src/apps/facet.ts`) | safe from build skew — in-process, both sides same build |
-
-`GET /probe` runs all four and returns `{hop: "ok" | "ERROR: …"}` — during a
-live skew event the response pinpoints the broken hop.
-
-## Reproduce locally (deterministic)
+Requires only `wrangler` authenticated against a test account with Worker
+Loader access. One command:
 
 ```
 npm install
-bash scripts/forge-version.sh          # the error, from workerd's own deserializer
+bash scripts/reproduce.sh
 ```
 
-The script stores a real value through DO storage, rewrites the persisted
-header's version byte to 255 (byte-for-byte what a payload from a newer
-build looks like), restarts workerd, and reads it back:
+The script deploys the main worker, arms 8 self-driving DO instances that
+run production-shaped facet traffic every 20s, ages them, verifies a
+clean baseline, then deploys/deletes/redeploys the trivial trigger worker
+in `trigger/` — a fetch handler that does nothing — polling for the error
+after each config change. A hit prints:
 
 ```
-workerd/io/stored-value.c++:85: … Error: Unable to deserialize cloned data
-due to invalid or unsupported version.; key = skew
+REPRODUCED: N deserialize outcomes on untouched instances
+  repro-h-3: 8 hits, first: {"at": "...", "outcome": "ERROR: Unable to deserialize cloned data due to invalid or unsupported version."}
 ```
 
-`FORGE_VERSION=<n>` bisects a build's acceptance threshold;
-`scripts/skew.sh <writer-ver> <reader-ver>` writes with one npm workerd
-build and reads with another (real cross-build persistence, no forging).
-
-## Reproduce the RPC hop (deterministic)
-
-The storage scripts above can only swap builds under `do_storage_kv`,
-whose writes are pinned and whose reader is lenient. These two run the
-**vulnerable hop** instead — a real cross-process JSRPC call between two
-workerd processes over a capnp CONNECT channel (`capnpConnectHost`,
-`workerd/rpc-{peer,client}.capnp`), which is the transport Cloudflare uses
-to deliver JSRPC between machines:
+**Reproduction conditions — read before judging a negative run.** All
+three observed waves hit instances that (a) held warm facet channels at
+the moment the config change propagated and (b) had aged since their own
+worker's last deploy (28 minutes to 16 hours; the worker's own deploy
+replaces every instance and briefly immunizes). A fresh one-shot run
+directly after first deploy has NOT reproduced, and waves are
+machine-sparse (3–13 of 24 instances per wave). The reliable protocol is
+the two-step:
 
 ```
-bash scripts/rpc-skew.sh 1.20250502.0 1.20260801.1   # two real builds, no forging
-bash scripts/rpc-forge.sh                            # the production error, on the RPC hop
+bash scripts/reproduce.sh arm       # deploy + arm, then leave running
+# ... 30+ minutes later (hours or overnight is better) ...
+BASE=<printed url> bash scripts/reproduce.sh trigger
 ```
 
-`rpc-forge.sh` interposes a TCP proxy (`scripts/rpc-forge-proxy.py`) that
-rewrites the V8 format-version byte of the argument list in flight — the
-JSRPC payload is a serialized JS array, header `FF 0F 41`, found at offset
-565 of the first post-CONNECT frame. The caller gets, from the peer's own
-deserializer:
+Ordinary account activity works as a trigger too: with instances armed,
+any deploy of any worker in the account can produce the wave.
+
+Manual equivalent:
 
 ```
-{"error":"Unable to deserialize cloned data due to invalid or unsupported version."}
+npx wrangler deploy                                   # main worker
+BASE=https://do-deserialize-repro.<subdomain>.workers.dev
+for i in 1 2 3 4 5 6 7 8; do
+  curl "$BASE/sauna/hammer?name=repro-h-$i&on=1&intervalMs=20000&redeployEvery=999"
+done
+sleep 90; curl "$BASE/sauna/stats?name=repro-h-1"     # hammerStats: all ok
+npx wrangler deploy -c trigger/wrangler.jsonc         # ← the trigger
+sleep 60; for i in 1 2 3 4 5 6 7 8; do
+  curl -s "$BASE/sauna/stats?name=repro-h-$i" | grep -o '"deserialize":[0-9]*'
+done
 ```
 
-`FORGE_VERSION=<n> scripts/rpc-forge.sh [build]` bisects a build's ceiling.
+Waves are machine-dependent (not every instance is hit every time); if a
+deploy produces nothing in ~3 minutes, `npx wrangler delete --name
+churn-trigger-dummy --force` — deletions produced the strongest observed
+wave — or redeploy and check again. Teardown:
+`curl "$BASE/sauna/hammer?fleet=0&name=repro-h-$i&on=0"` per instance and
+`npx wrangler delete` both workers.
 
-## The error string is not specific to version skew
+## Evidence: verified waves and controls
 
-`scripts/rpc-failure-modes.sh` damages the payload five different ways on
-the same hop and shows what each one looks like:
+All times 2026-08-06 UTC, one account, 24 instrumented instances
+(`src/sauna-shaped.js`, results persisted in each instance's SQLite):
 
-| damage | result |
-|---|---|
-| version byte bumped past the ceiling | `Unable to deserialize cloned data due to invalid or unsupported version.` |
-| header tag `0xFF` zeroed | **same message** |
-| one byte flipped mid-payload | no error — silently corrupted data (`do-deserialize-rero`) |
-| payload truncated at the tail | `Network connection lost.` |
-| payload cut just after the header | request hangs until the caller times out |
-| payload over 32MiB | `Serialized RPC arguments or return values are limited to 32MiB…` |
+| time | account action | result |
+|---|---|---|
+| 05:06:08 | `wrangler delete` of a sibling worker | 13/24 instances wedged within seconds; onsets staggered 05:06→05:21; each stuck 15–30 min across 3–6 probe rounds; fresh-facet retries failed every time |
+| 21:27:49 | deploy of `trigger/` dummy | 12 instances wedged, mid-flight rounds included |
+| 21:40:39 | redeploy of the dummy — **zero other actions in flight** | 3 instances wedged, two of them on idle 5-minute cadence untouched for hours |
+| — | control: no account config change | 16 h / ~50,000 outcomes, zero errors |
+| — | control: cadence/config changes to the repro's own worker just after its own deploy | zero errors (own-worker deploys replace instances wholesale) |
 
-So the production message means only "the bytes where a V8 payload should
-start do not parse as a V8 header". A newer-build writer is one way to get
-there; a buffer read at the wrong offset, or bytes that were never a
-serialized value, produce it identically. Note also that mid-payload
-corruption is **not** caught — it returns wrong data with no error.
+Also reproduced along the way (see [FINDINGS.md](FINDINGS.md)):
+`facets.abort()` racing in-flight facet writes intermittently yields
+`Internal error in Durable Object storage caused object to be reset` —
+per-instance bursts of 22–25, possibly the same defect surfacing at a
+different layer.
 
-## Findings from running this (2026-08-02)
+## What the reproduction worker is
 
-- All four hops work under `wrangler dev` — the whole apps-runtime shape
-  (DO supervisor + Worker Loader facet + RPC + storage) reproduces in one
-  file.
-- Storage writes are version-pinned: an Aug 2026 build writes format
-  version **15** (a 2021-era version). This is why the production wedge
-  never corrupts data and why alarms/facet work while RPC fails.
-- **The RPC hop enforces a much tighter version check than storage.** The
-  storage reader accepts forged versions up to 254; the JSRPC reader
-  accepts only up to its build's ceiling and throws the production error
-  one past it. Same error string, different strictness — which is why the
-  wedge shows up on RPC and never on stored data.
-- **The ceiling moved during the incident window.** Bisected by forging
-  version 16 onto the RPC hop:
+`src/sauna-shaped.js` is a structural copy of a production app platform:
+a supervisor DO that boots a Worker Loader facet with `ctx.exports`
+loopback bindings (`env` service binding, `globalOutbound`, a tail
+worker), runs dispatches and SQL through it (row sets incl. BLOBs, SSE
+streams, schedule ticks), writes SQLite on both sides of every call, and
+self-drives via DO alarms. A `facetMode` switch strips boot-config pieces
+(`bare` / `no-tails` / `no-outbound` / `no-platform`) for bisection; a
+`no-outbound` instance has been hit, so `globalOutbound` is not required.
+The channel bisection is otherwise incomplete.
 
-  | build | accepts format version 16 |
-  |---|---|
-  | `1.20260601.1`, `1.20260615.1`, `1.20260617.1` | no — production error |
-  | `1.20260619.1`, `1.20260623.1`, `1.20260630.1`, `1.20260801.1` | yes |
+## Production impact (summary; full trail in FINDINGS.md)
 
-  So V8's serializer ceiling went 15 → 16 between **1.20260617.1** and
-  **1.20260619.1**, and sauna's onset was ~2026-06-30 — the fleet rolling
-  out a post-06-19 build. Any peer still on a pre-06-19 build rejects a
-  version-16 payload with exactly this error.
-- **Frequency in production contradicts a rollout-only cause.** Apps wedge
-  several times a day, in active use, on days with one or two runtime
-  rollouts. Staged skew cannot fire that often — see the failure-mode
-  table above for what else yields the identical message.
-- Both directions still round-trip between real npm builds
-  (`rpc-skew.sh 1.20250502.0 1.20260801.1`), because npm readers accept 16
-  but every npm **writer** still emits 15. The producing side of the
-  production skew is therefore a fleet build emitting 16 — ahead of npm,
-  so only Cloudflare can name it. See "Upstream" below.
+- ~5 wedge episodes/day across 15+ apps for 5+ weeks (onset ~2026-06-30),
+  each 503ing an app for minutes to over an hour.
+- Fully instrumented episodes show: DO reachable (answers other RPC on
+  the same boundary during the wedge), throw at the facet call, recovery
+  abort + retry against a freshly created facet failed **23 of 23 times**.
+- Wedged apps had not deployed in weeks — the trigger is account-level,
+  not app-level, matching this repro.
+- Wedge timestamps cluster on quarter-hour boundaries: scheduled-task
+  alarms are the facet traffic that first notices the poison.
 
-## What production actually shows (Honeycomb, 2026-08-03)
+## Questions for Cloudflare
 
-`apps-production`, warn logs with `hop` set, last 7 days:
+1. What does account config propagation invalidate in the dynamic-loader
+   / facet pipeline while warm channels still reference the previous
+   state? The error suggests a serialization version/brand-table mismatch
+   read by V8's deserializer.
+2. Why does a **freshly created facet** on the same instance inherit the
+   poison (retries failed 23/23 in production, reproducibly here), and is
+   there any in-band cure short of `ctx.abort()` on the instance?
+3. Can the failure be surfaced as a distinguishable error (or healed
+   transparently), rather than the generic deserialize message?
 
-- **161 events / 34 episodes / 15 distinct apps** — roughly five wedge
-  episodes a day, every day. All of them `label=db_query`, body
-  `db/query hit deserialize-version error`.
-- **Every one is `hop=route_to_do`. Zero `hop=do_to_facet`.** The facet
-  call and `ctx.facets.get()` both sit inside `withFacetRecovery`, so a
-  throw there would log `do_to_facet` — the failure is on the worker↔DO
-  JSRPC boundary, not the facet hop.
-- Spread across **17 apps-worker script versions** in 7 days, i.e. every
-  deployed version. Two rollouts a day cannot explain five episodes a day
-  across every version — this is continuous background behaviour, not
-  rollout skew.
-- Every episode sits inside an agent session trace: these are agent-driven
-  `db/query` tool calls, which is why it correlates with apps being used.
-- Episodes are bursts of 2–6 retries seconds apart, then the app recovers
-  on its own.
+We know facets and Worker Loader are experimental; this is offered as a
+worked reproduction, not a complaint about stability guarantees.
 
-## Cold-start probe (the current bet)
+## Also in this repo
 
-`src/coldstart.js` + `wrangler.coldstart.jsonc`, deployed separately as
-`do-coldstart-probe`. The `/probe` worker above hits one DO every five
-minutes, so it is never cold — it cannot catch a wedge that fires on the
-first RPC into an idle DO.
-
-This one runs 82 supervisor-shaped DOs (own SQLite + a Worker Loader facet
-with persisted state) in dwell cohorts of 15m / 1h / 6h / 24h. A one-minute
-cron probes only the DOs whose dwell has elapsed, one RPC each, and writes
-every outcome to a registry DO's SQLite so a hit survives log retention.
-
-```
-npx wrangler deploy -c wrangler.coldstart.jsonc
-curl https://do-coldstart-probe.sauna-dev.workers.dev/stats
-```
-
-Each result carries `coldBoot`, measured idle minutes, the hop that failed
-(`route_to_do` vs `do_to_facet` — the same split `withFacetRecovery` makes)
-and whether the error was the deserialize one, so edge blips and the real
-wedge stay distinguishable. Throughput is ~2 cold starts/minute (~3k/day).
-
-## Abort-churn probe (2026-08-05: what production actually settled)
-
-The first day of exported DO logs (sauna PR #5208) pinned the failure to
-the **DO→facet hop** and killed the transport theories:
-
-- Every wedged call logs `hop=in_do` — the DO method body runs.
-- `withFacetRecovery` fires (`retried=true`) ~23×/day, and **23/23 retries
-  against a freshly booted facet failed with the identical error**
-  (`recovered=false`). The wedge survives facet recreation; only instance
-  discard or eviction clears it.
-- The reachability probe reads `reachable` on every episode — the DO
-  answers `getMeta` over the same worker↔DO boundary while the facet hop
-  fails.
-
-So the poison is **instance-level, in-memory, specific to the facet
-machinery** — and the one operation production performs on that machinery
-around every wedge is `ctx.facets.abort()` (deploys and the recovery path
-both call it, and #5195 independently showed it poisons hibernatable WS
-delivery). The churn probe tests whether the abort is also the *trigger*:
-
-- `/churn` — redeploy-under-traffic rounds: in-flight `slow()` calls into
-  facet A, `facets.abort()` mid-flight, immediately boot facet B (new code
-  id) and hammer it. `scripts/abort-churn.sh` drives it across instances
-  and abort timings.
-- `/stampede` — the concurrent shape (production logged two recovery
-  aborts in the same second): N workers loop call → on failure abort +
-  retry on the same code id (the `withFacetRecovery` shape), periodic
-  deploy-style aborts, boots stretched by `bootDelayMs` so aborts land
-  mid-boot.
-- The 5-minute cron runs one churn round + one stampede per tick across
-  six rotating instances and persists tallies in the registry —
-  `/churn/stats` — so a hit survives log retention.
-
-Results so far (2026-08-05):
-
-- **360 sequential abort-under-traffic rounds: zero deserialize outcomes.**
-  In-flight calls die with the abort reason, post-abort boots are clean.
-- **~2,500 stampede iterations: zero deserialize outcomes.** But the race
-  regime is real: aborts landing mid-boot produce opaque
-  `internal error; reference = …` failures (not clean abort rejections),
-  and >4 concurrent dynamic-worker invocations per request hit an
-  undocumented Worker Loader concurrency cap.
-
-So a bare abort/boot race does not mint the wedge at this scale, on this
-build, with a trivial facet. Untested ingredients production has and this
-probe does not: hibernatable WebSockets registered on the instance
-(#5195's poison target), multi-MB app bundles, facet SQLite of real size,
-and whatever build the wedged hosts run. The cron accumulates ~40k
-outcomes/day in the meantime.
-
-## Sauna-shaped reproduction (2026-08-05, closing the fidelity gap)
-
-`src/sauna-shaped.js`: a structural copy of the production apps runtime
-rather than a minimal probe — production wedges correlate with *real use*
-("a bunch of writes, actually using the app"), so every channel real use
-exercises is present:
-
-- `SaunaSupervisor` DO mirroring `app-supervisor.ts`: invocations /
-  worker_logs / meta SQLite writes bracketing every facet call,
-  `withFacetRecovery` (abort + retry), context headers, redeploy path
-  (facet abort + new runtime id).
-- The vendored wrapper (`wrapper-source.ts`): `blockConcurrencyWhile` boot
-  with DDL + a drizzle-shaped migration journal (re-runs on every
-  hibernation wake), `recordInput` facet-SQLite write on every dispatch,
-  verbatim `__sqlExec` returning row sets.
-- The loopback entrypoints from `facet.ts`: `AppInvocationControl` as the
-  facet's `env.APP_PLATFORM`, `AppPipedreamProxy` as `globalOutbound`,
-  and the `AppLogTail` tail worker — every app `console.log` re-enters
-  the same supervisor DO via `ingestLogs`, concurrently with dispatches.
-- A handler doing meaningful work: bulk inserts, row-returning reads,
-  outbound fetches, logs on every request; a 256KB pad module for
-  non-trivial compiles.
-
-Drive it: `/sauna/use?name=X&rounds=4&burst=4&redeployEvery=3`, check
-`/sauna/verify?name=X`, `/sauna/stats?name=X`; the cron adds two rounds
-per tick on six rotating instances (each idles ~25 min between turns, so
-hibernation wakes are covered) — accumulated in `/sauna/accumulated`.
-
-### Findings so far
-
-**~2,400 outcomes across 20 instances under heavy concurrent use with
-redeploys: zero deserialize errors — but a new failure mode:**
-
-```
-Internal error in Durable Object storage caused object to be reset;
-```
-
-Redeploy aborts racing in-flight bulk writes trip an internal error in
-the DO **storage layer**, and the platform resets the instance. It
-clusters hard per-instance (3 of 12 instances took 22–25 resets each;
-the other 9 took zero) and the reset destroys in-memory state (the
-supervisor's `codeVersion` reverts), i.e. the platform performs the
-equivalent of `ctx.abort()`. Every instance recovered afterwards.
-
-That chain — facet abort under write load → storage-layer internal error
-→ per-instance failure burst → cleared by instance replacement — has
-exactly the shape of the production wedge except the error string. The
-missing conversion from "storage reset" to "poisoned deserialize state"
-may need production's state sizes, its workerd build, or an unlucky
-timing this harness hasn't hit yet; the cron keeps rolling the dice.
-
-## REPRODUCED ON DEMAND (2026-08-06): the trigger is account config propagation
-
-**Recipe** (verified three independent times in one day):
-
-1. Run a worker with supervisor-shaped DOs actively using Worker Loader
-   facets (the hammer fleet below — production-shaped dispatch/db-query
-   traffic keeping facet channels warm).
-2. Deploy **or delete any other worker in the same Cloudflare account**
-   (`/tmp`-grade dummy worker suffices; the affected worker itself is not
-   touched).
-3. Within seconds to ~3 minutes, active DO instances of the *untouched*
-   worker start failing every facet call with
-   `Unable to deserialize cloned data due to invalid or unsupported
-   version.` — dispatch and `__sqlExec` both, while the DO's own RPC and
-   SQLite stay healthy. Severity varies per wave: transient (one round)
-   to sticky 15–30 minutes, surviving `facets.abort()` + retry, cured
-   only by instance replacement/eviction.
-
-Observed waves: 05:06 UTC (trigger: `wrangler delete` of a sibling
-worker → 13/24 instances, sticky, staggered onsets 05:06→05:21),
-21:27 (dummy deploy → 12 instances, sticky ~1–3 min at 20s cadence),
-21:40 (dummy redeploy, zero fleet-side actions in flight → 3 instances
-including two idle-cadence ones, transient). Control: with no account
-config change, identical fleet activity ran clean for 16 hours
-(~50k outcomes) — and reconfigure/cadence changes alone do nothing on a
-freshly deployed version.
-
-**Why production sees it "fairly soon on any app you actually use":**
-the production account deploys workers many times a day (the apps worker
-itself ~2x/day, plus every other service). Each such config propagation
-can wedge the supervisors of whatever apps hold *warm facet channels* at
-that moment — i.e. exactly the apps someone is using. Deploying the apps
-worker itself replaces its DO instances (cure), which is why wedges
-appear to "persist until redeploy". Scheduled-task alarms clustering on
-quarter-hours gave the earlier boundary correlation: they are the
-facet activity that notices the poison.
-
-Mechanism (hypothesis, for Cloudflare): config propagation
-rotates/invalidates account-level state in the dynamic-loader / facet
-pipeline while warm channels still hold references from the previous
-epoch; subsequent facet dispatches deserialize against mismatched
-tables and surface V8's version error. Which boot-config channel is
-required is not yet bisected — the 21:40 wave hit a `no-outbound`
-instance, so `globalOutbound` at least is not necessary.
-
-The trigger worker lives at `/tmp`-equivalent simplicity: any
-`wrangler deploy` in the account. `churn-trigger-dummy` is kept in the
-account as the trigger tool.
-
-## What triggers it in production — eliminations (2026-08-06)
-
-ClickHouse `app_supervisor_meta` for the apps that wedged on 2026-08-05:
-`sauna-home-v2` last deployed **07-06**, `sauna-home-d2ungulk` **07-05**,
-`ceo-desk` **07-04**, `expedition` **07-27** — apps that had not deployed
-in weeks wedged repeatedly. So the original onset is **not** app deploys
-(and earlier: not cold starts, not payload content, not concurrency, not
-`facets.abort()` races at n≈10k).
-
-Meanwhile every instrumented episode (post-#5208 DO logs, including
-`meego-support` on 2026-08-06 03:56 UTC with `phase=facet_call` captured
-on the db_query path) shows the same thing: the **entire facet channel**
-of one DO instance dies — dispatch and `__sqlExec` both — while
-`getMeta`/`listLogs` on the same instance answer normally, retries
-against freshly booted facets fail 100% of the time, and the state is
-in-memory (eviction or instance replacement cures it).
-
-The hypothesis that fits everything remaining: **build skew between the
-DO's workerd process and the process pool hosting Worker Loader
-facets**, created when a Cloudflare fleet rollout passes under
-long-lived instances. That cannot be forced from user code — it can only
-be caught in the act, which is what the hammer fleet below is for. The
-sharpest counter-evidence to date is also recorded honestly: sauna's
-apps run in one process model and this repo's probes in the same one,
-and no local pair of published builds fails this hop.
-
-## The hammer fleet (self-driving, catches rollouts in the act)
-
-24 sauna-shaped instances drive themselves via DO alarms at a 5-minute
-cadence — each alarm runs a compact production-shaped round (schedule
-tick, bulk writes, blob write/read, row reads, SSE stream, outbound
-fetch, db/query, periodic redeploy), and the gap between alarms means
-every tick is a genuine restart-from-idle. ~7k rounds/day across the
-fleet, roughly $1–2/day (instances evict between ticks; row writes are
-the other cost). A rollout wave sweeps a colo over tens of minutes to
-hours, so the 5-minute cadence loses no detection power; on a hit,
-restart the hammer with a small `intervalMs` for fine-grained
-persistence forensics. The separate `do-coldstart-probe` worker (82 DOs,
-1-minute cron) answered its question and has been deleted. Watch:
-
-```
-curl $BASE/sauna/fleet?n=24        # per-instance runs / resets / hits
-curl $BASE/sauna/accumulated       # cron-leg tallies
-curl $BASE/churn/stats             # abort-churn tallies
-curl "$BASE/sauna/hammer?fleet=24&on=0"   # teardown
-```
-
-A deserialize hit persists in the instance's own storage (`hits[]` with
-timestamps) and logs `SAUNA HAMMER HIT` to Workers Logs. If a rollout
-wedges any instance, the 20s cadence measures persistence and recovery
-timing automatically.
-
-## Hypotheses eliminated
-
-Each was tested on the real cross-process JSRPC hop and did **not**
-reproduce the error:
-
-| hypothesis | result |
-|---|---|
-| build skew between published builds | round-trips across `1.20250502.0` ↔ `1.20260801.1`, both directions |
-| oversized payload | 32MiB limit has its own explicit message |
-| lone surrogates / NUL / invalid pairs in row strings | all round-trip |
-| 50-way concurrent RPC on one connection | 200/200 calls clean |
-
-## Reproduce in production (the real trigger)
-
-`npm run deploy`, then watch. The worker probes all four hops every 5
-minutes via cron (`scheduled`) and `console.error`s failing hops into
-Workers Logs. During a staged runtime rollout (sauna hit it 2026-07-14,
--16, -20, -23), expect:
-
-```
-probe failures {"rpc_worker_to_do":"ERROR: Unable to deserialize cloned data …"}
-```
-
-while `http_worker_to_do` stays `ok` — the observation behind sauna's
-ADR-0030 (move the worker↔DO boundary to `stub.fetch` HTTP).
-
-## Upstream ask (Cloudflare)
-
-A long-lived DO pinned to a host on the other side of a rollout stays
-unreachable over JS RPC for days (its V8 payload versions disagree with its
-peers'), while HTTP `stub.fetch` to the same DO keeps working. Ask: pin the
-RPC serialization version across staged rollouts the way stored values
-already are, or version-negotiate the RPC channel. This repo is the
-minimal testcase: deploy it, run a staged rollout, watch
-`rpc_worker_to_do` fail while `http_worker_to_do` passes.
-
-Concretely: `scripts/rpc-forge.sh` shows the failure mode on a single
-build, and the bisect above shows the reader ceiling rising 15 → 16 at
-`1.20260619.1`. The question for Cloudflare is which fleet build began
-**emitting** version 16, and whether it was rolled out to hosts whose
-JSRPC peers were still pre-`1.20260619.1` — that pairing is sufficient to
-produce every symptom seen (RPC dead, `stub.fetch` fine, stored data
-intact, per-DO and durable across redeploys).
+- `scripts/rpc-forge.sh`, `scripts/rpc-skew.sh`, `scripts/forge-version.sh`
+  — deterministic local demonstrations (npm workerd builds) of the same
+  error from V8's own deserializer, including a bisect showing the JSRPC
+  reader's format-version ceiling moved 15→16 between `1.20260617.1` and
+  `1.20260619.1`, and `scripts/rpc-failure-modes.sh` showing which payload
+  damage yields which error.
+- [FINDINGS.md](FINDINGS.md) — the full chronological investigation,
+  including every eliminated hypothesis (build skew between published
+  builds, cold starts at n=2,452, payload content, concurrency, abort
+  races at n≈10k) and the production telemetry that guided it.

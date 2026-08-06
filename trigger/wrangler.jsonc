@@ -1,0 +1,9 @@
+{
+  // Deploying or deleting this worker is the account config change that
+  // wedges other workers' warm facet channels. The loader binding mirrors
+  // the original observation; a plain worker may suffice.
+  "name": "churn-trigger-dummy",
+  "main": "worker.js",
+  "compatibility_date": "2026-04-17",
+  "worker_loaders": [{ "binding": "LOADER" }]
+}

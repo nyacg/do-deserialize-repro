@@ -958,6 +958,20 @@ export class SaunaSupervisor extends DurableObject {
         stats.otherErrors += 1;
       }
     }
+    /** Every failed round, with the error text: non-deserialize failures
+     * (e.g. `internal error; reference = …`) are otherwise only a count. */
+    const failed = outcomes.filter((outcome) => outcome !== "ok");
+    if (failed.length > 0) {
+      stats.failedRuns = [
+        ...(stats.failedRuns ?? []).slice(-39),
+        {
+          at: stats.lastRunAt,
+          deserialize: failed.filter((o) => o.includes(DESERIALIZE_NEEDLE)).length,
+          other: failed.filter((o) => !o.includes(DESERIALIZE_NEEDLE)).length,
+          samples: [...new Set(failed.map((o) => o.slice(0, 160)))].slice(0, 3),
+        },
+      ];
+    }
     await this.ctx.storage.put("hammer-stats", stats);
     await this.ctx.storage.setAlarm(Date.now() + cfg.intervalMs);
   }
@@ -1127,6 +1141,7 @@ export const saunaRoutes = async (url, env) => {
             facetEvents: stats.facetEvents,
             lastError: stats.lastError,
             hits: h?.hits?.length ? h.hits : undefined,
+            failedRuns: h?.failedRuns?.length ? h.failedRuns : undefined,
           };
           if (h) {
             totals.runs += h.runs;

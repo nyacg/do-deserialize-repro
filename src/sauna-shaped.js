@@ -553,6 +553,13 @@ export class SaunaSupervisor extends DurableObject {
       this.ctx.storage.sql.exec(
         "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)",
       );
+      /**
+       * A probe that wakes an evicted instance boots the facet before any
+       * alarm runs; without this it would boot in `full` regardless of the
+       * armed mode and facets.get would keep that facet until eviction.
+       */
+      const hammer = await this.ctx.storage.get("hammer");
+      this.facetMode = hammer?.facetMode ?? "full";
     });
   }
 
@@ -804,7 +811,16 @@ export class SaunaSupervisor extends DurableObject {
       invocationsOk: invocations.ok,
       lastError: lastError[0]?.v ?? null,
       codeVersion: this.codeVersion,
+      facetMode: this.facetMode,
       facetEvents: facetEvents.rows?.[0]?.n ?? facetEvents.error,
+      hammer: (await this.ctx.storage.get("hammer")) ?? null,
+      hammerStats: (await this.ctx.storage.get("hammer-stats")) ?? null,
+    };
+  }
+
+  /** Storage-only read: no SQL, no facet call, so polling never touches the facet channel. */
+  async hammerStats() {
+    return {
       hammer: (await this.ctx.storage.get("hammer")) ?? null,
       hammerStats: (await this.ctx.storage.get("hammer-stats")) ?? null,
     };
@@ -813,6 +829,7 @@ export class SaunaSupervisor extends DurableObject {
   /* ──────────── the hammer: self-driving load via DO alarms ──────────── */
 
   async startHammer(cfg) {
+    this.facetMode = cfg.facetMode ?? "full";
     await this.ctx.storage.put("hammer", {
       appId: cfg.appId,
       intervalMs: cfg.intervalMs ?? 20_000,
@@ -1086,13 +1103,19 @@ export const saunaRoutes = async (url, env) => {
     }
     case "/sauna/fleet": {
       const n = Number(url.searchParams.get("n") ?? 12);
+      const prefix = url.searchParams.get("prefix") ?? "sauna-hammer-";
+      /** light=1 reads persisted counters only — no facet probe per instance. */
+      const light = url.searchParams.get("light") === "1";
       const fleet = {};
       const totals = { runs: 0, outcomes: 0, ok: 0, deserialize: 0, resets: 0, otherErrors: 0 };
       for (let i = 1; i <= n; i++) {
-        const target = `sauna-hammer-${i}`;
+        const target = `${prefix}${i}`;
         const stub = env.SAUNA_SUP.get(env.SAUNA_SUP.idFromName(target));
         try {
-          const stats = await withTimeout(stub.stats(target), 15_000);
+          const stats = await withTimeout(
+            light ? stub.hammerStats() : stub.stats(target),
+            15_000,
+          );
           const h = stats.hammerStats;
           fleet[target] = {
             runs: h?.runs ?? 0,
@@ -1100,7 +1123,7 @@ export const saunaRoutes = async (url, env) => {
             resets: h?.resets ?? 0,
             otherErrors: h?.otherErrors ?? 0,
             lastRunAt: h?.lastRunAt ?? null,
-            mode: (await stub.stats(target).catch(() => null))?.hammer?.facetMode,
+            mode: stats.hammer?.facetMode,
             facetEvents: stats.facetEvents,
             lastError: stats.lastError,
             hits: h?.hits?.length ? h.hits : undefined,

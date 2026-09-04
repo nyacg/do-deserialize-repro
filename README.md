@@ -109,9 +109,11 @@ loopback bindings (`env` service binding, `globalOutbound`, a tail
 worker), runs dispatches and SQL through it (row sets incl. BLOBs, SSE
 streams, schedule ticks), writes SQLite on both sides of every call, and
 self-drives via DO alarms. A `facetMode` switch strips boot-config pieces
-(`bare` / `no-tails` / `no-outbound` / `no-platform`) for bisection; a
-`no-outbound` instance has been hit, so `globalOutbound` is not required.
-The channel bisection is otherwise incomplete.
+(`bare` / `no-tails` / `no-outbound` / `no-platform`) for bisection. A
+20-hour cohort run (FINDINGS.md, 2026-09-03) showed every mode fails in
+the same episodes; `full` surfaces the deserialize error while `bare` and
+`no-platform` surface `internal error; reference = …`, so the `env` stub
+only determines the error text.
 
 ## Production impact (summary; full trail in FINDINGS.md)
 

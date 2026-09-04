@@ -417,3 +417,65 @@ build, and the bisect above shows the reader ceiling rising 15 → 16 at
 JSRPC peers were still pre-`1.20260619.1` — that pairing is sufficient to
 produce every symptom seen (RPC dead, `stub.fetch` fine, stored data
 intact, per-DO and durable across redeploys).
+
+## Boot-config bisection (2026-09-03/04): every mode fails; `env` decides the error text
+
+Three cohorts of 12 supervisor instances ran side by side for 20 hours in
+the same account as the 24-instance hammer fleet: `full` (production boot
+config: `env.APP_PLATFORM` loopback stub, `globalOutbound`, `tails`),
+`no-platform` (no `env`), and `bare` (no `env`, no `globalOutbound`, no
+`tails`). 5-minute cadence, no redeploys (`redeployEvery=999`), one
+production-shaped round (9 facet calls) per tick. Polling used
+`/sauna/fleet?prefix=&light=1`, which reads persisted counters without a
+facet call; `stats()` previously booted the facet in `full` mode on a
+woken instance regardless of the armed mode, which would have contaminated
+the cohorts (fixed in `a6cc341`). Every failed round is persisted with its
+error text (`failedRuns`, `ea1817e`).
+
+Result — cells are distinct instances hit / failed rounds:
+
+| episode (UTC) | full | no-platform | bare | old fleet (±10 min) |
+|---|---|---|---|---|
+| 09-03 11:06–11:12 | 12/19 | 11/21 | 12/19 | 2 |
+| 09-03 13:36–14:52 | 12/51 | 11/59 | 11/66 | 3 |
+| 09-03 16:22 | 11/11 | 11/11 | 8/8 | 4 |
+| 09-03 22:18 | 11/11 | 12/12 | 12/12 | 0 |
+| 09-03 16:52–17:12 | 0 | 1/5 | 0 | 0 |
+| 09-04 00:53 | 0 | 2/2 | 4/4 | 0 |
+
+In every episode that reached the cohorts, all three failed whole rounds
+within the same seconds, on the same instance counts. The error text is
+determined by the mode, with no exceptions across 252 persisted failed
+rounds:
+
+- `full`: `Unable to deserialize cloned data due to invalid or unsupported version.`
+- `no-platform` and `bare`: `internal error; reference = <id>`
+
+So the facet/loader channel dies regardless of what the boot config
+carries. The `env` binding (a `ctx.exports` service-binding stub with
+`props`) is where the failure surfaces as V8's deserialize error; without
+it the same event surfaces as a generic internal error. `globalOutbound`
+and `tails` stubs (still present in `no-platform`) do not produce the
+deserialize text. Removing `env` from the production boot config would
+change the error string, not restore service.
+
+Also observed:
+
+- Placement dominates who is hit. The 36 cohort instances were created
+  within 20 s and fail together; the old fleet (created 2026-08-06) is hit
+  in rolling subsets of 3–12 instances (e.g. 11:08–12:35: instances
+  14 → 16 → 11 → 19 → 7), consistent with a sweep across machines.
+  Three episodes hit the old fleet only (11:08–12:35, 20:30, 09-04 06:22).
+- Episodes last 1–6 rounds (5–75 min) and end on their own; an own-worker
+  redeploy mid-episode (11:13) coincided with the cohorts' recovery while
+  the old fleet kept wedging on other machines.
+- Two small episodes hit only `no-platform`/`bare` instances (one instance
+  × 5 rounds; six instances × 1 round). No episode hit only `full`.
+- The account sees ~280 worker deploys/day (preview CI); three deliberate
+  `churn-trigger-dummy` deploy/delete/deploy cycles (11:37, 12:12, 12:47)
+  produced no additional episode on top of that background.
+
+Question for Cloudflare, sharpened: the same event yields two error
+surfaces depending only on whether the dynamic worker's `env` carries a
+service-binding stub. Which side deserializes that stub at facet start,
+and what does the `internal error` reference id map to on the `bare` path?
